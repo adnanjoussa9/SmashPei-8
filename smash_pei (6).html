@@ -57209,6 +57209,525 @@ html.tact .topbar{ display:none !important; }
   }
 })();
 
+
+/* ===== 105-sprites.js ===== */
+/* ============================================================
+   SMASH PÉI — UN PERSONNAGE PEUT PASSER EN SPRITES
+
+   Le joueur veut pouvoir faire un personnage dans Blender, sans
+   jeter le rendu vectoriel qui porte les 63 autres. Ce module est
+   l'autre bout du pipeline décrit dans `tools/` :
+
+       jeu  ──SPRITES.exporterPoses()──▶  <perso>.poses.json
+       Blender  (tools/blender/sp_rendu_spritesheet.py)  ──▶  PNG
+       Node     (tools/spritesheet/sp_assembler.mjs)     ──▶  <perso>.png
+                                                           + <perso>.json
+                                                           + <perso>.sprites.js
+       jeu  ◀──  sprites/<perso>.sprites.js
+
+   CE QU'IL FALLAIT RESPECTER
+   L'audit de l'étape 1 a montré que TOUT corps passe par une seule
+   fonction, `drawFighterRig(ctx, ch, pose, opt)` : le combat, les
+   replays, la sélection, le vestiaire, l'écran de victoire, le
+   portrait du HUD. C'est donc là, et seulement là, qu'on branche.
+   Un personnage déclaré en sprites est dessiné depuis sa planche ;
+   tous les autres passent par l'original, sans une ligne de
+   différence.
+
+   CHOISIR L'IMAGE SANS CONNAÎTRE L'ANIMATION
+   `drawFighterRig` ne reçoit qu'une POSE, jamais le nom de
+   l'animation. Plutôt que d'aller chercher l'état du combattant
+   partout où la fonction est appelée, on choisit l'image dont la
+   pose est LA PLUS PROCHE de la pose demandée : chaque image de la
+   planche garde la pose qui l'a produite. C'est ce qui permet aux
+   replays (qui ne connaissent que des poses) et aux menus de
+   fonctionner sans rien changer chez eux. Quand on sait qui est
+   dessiné (combat), on restreint la recherche à la famille
+   d'animation qui correspond à son état : idle, walk, run, jump,
+   attack, hitstun, victory.
+
+   Le déplacement du bassin (hipX), l'écrasement (sx, sy) et la
+   rotation du corps (hipRot, la vrille du TUMBLE) ne sont PAS rendus
+   dans Blender : ils sont appliqués ici, au dessin, exactement comme
+   le fait le squelette vectoriel. Autant d'images en moins, et une
+   vrille parfaitement fluide.
+
+   LES COSMÉTIQUES
+     · Les chapeaux, visages et lunettes « classiques » sont écrits EN
+       DUR dans `drawHead`, pas derrière un crochet. Pour qu'un
+       personnage en sprites les garde tous, le mode par défaut est
+       TÊTE VECTORIELLE : Blender rend le corps et le cou, et la tête
+       reste dessinée par `drawHead`, au point exact où le squelette
+       l'aurait posée. Chapeaux, visages, traits, clignement, bouche,
+       `COS_TETE` et `COS_VISAGE` : tout fonctionne comme avant.
+     · En mode TÊTE SPRITE (la tête est dans le rendu), seuls les
+       crochets étendus sont posés, sur les ancres calculées :
+       `COS_TETE`, `COS_VISAGE`, `drawTraitTete` pour les traits de
+       vestiaire. Les chapeaux classiques sont alors perdus.
+     · `COS_DOS` et les objets de dos du vestiaire sont dessinés
+       derrière le corps, sur les ancres du bassin et de la poitrine.
+     · `COS_AURA` ne dessine pas le corps, il émet des particules
+       depuis le combattant : il marche tel quel.
+     · Les PEAUX (recoloration) : la planche est peinte une fois pour
+       toutes. On retrouve l'écart de teinte, de saturation et de
+       luminosité entre la palette d'origine et la palette recolorée,
+       et on l'applique avec `ctx.filter`. Si le navigateur ne connaît
+       pas `ctx.filter`, la peau est ignorée, rien ne casse.
+
+   CE QUI NE S'APPLIQUE PAS À UN PERSONNAGE EN SPRITES
+   Les deux étages de lumière (modules 44 et 83 : dégradé, contre-
+   jour, vernis) enveloppent `drawFighterRig` AVANT nous, et nous
+   sommes la couche la plus externe : un personnage en sprites ne
+   passe donc pas par eux. C'est voulu — sa lumière est celle du
+   rendu Blender — mais c'est une différence visible à connaître.
+
+   Deux autres limites, propres à toute image pré-rendue :
+     · une pièce du vestiaire qui RETIRE un élément natif (un objet de
+       dos qui remplace la cape de Ti Jean) ne peut pas l'effacer : la
+       cape est peinte dans la planche ;
+     · la valeur de retour { headX, headY, … } est rendue, mais les
+       enveloppes 44 et 83 ne la transmettaient déjà pas : aucun
+       appelant ne s'en sert.
+
+   EN CAS DE PROBLÈME, ON RETOMBE SUR LE VECTORIEL : planche absente,
+   image pas encore chargée, métadonnées invalides, erreur au dessin,
+   image séparée ouverte en file:// (elle contaminerait le canevas :
+   l'exposition automatique du bloc 94 et l'export des clips lisent
+   l'écran). Un personnage ne disparaît jamais de l'écran.
+
+   MESURE — la chaîne complète, sans Blender : le jeu lui-même a servi
+   de moteur de rendu, au cadrage exact du script Blender, pour Ti Jean
+   (tête vectorielle) et le Volkan (tête sprite), 131 images chacun.
+     · le calcul du squelette du script Python et celui du jeu : 524
+       poses, écart maximal 1e-14 px ;
+     · silhouette sprite contre silhouette vectorielle, huit poses dont
+       une vrille : 5,1 % et 2,6 % de pixels différents (l'antialiasing
+       de la mise à l'échelle et la pose la plus proche) ;
+     · chapeau classique, COS_TETE, COS_DOS, COS_VISAGE et peau
+       recolorée : visibles sur les deux personnages en sprites ;
+     · un match à trois (deux en sprites, un vectoriel) : aucune erreur,
+       le canevas reste lisible (exposition et clips intacts).
+   ============================================================ */
+(function spritesheets() {
+  if (typeof window === 'undefined' || typeof drawFighterRig !== 'function') return;
+  if (window.SPRITES && window.SPRITES.__v105) return;
+
+  /* ------------------------------------------------------------
+     LA TABLE DE RÉGLAGE
+     ------------------------------------------------------------ */
+  const SPRITES_CONFIG = {
+    /* dossier des planches, relatif au fichier HTML */
+    DOSSIER: 'sprites/',
+    /* identifiants des personnages à charger au démarrage, par
+       exemple ['tijean']. Le module injecte alors
+       `sprites/tijean.sprites.js`. On peut aussi appeler
+       `SPRITES.charger('tijean')` à la main. */
+    ACTIFS: [],
+
+    /* Les familles d'animation et les états du combattant qui les
+       utilisent. Un état absent de la table cherche dans toute la
+       planche. */
+    FAMILLES: {
+      idle: ['idle', 'crouch', 'shield', 'shieldstun', 'ledgeget', 'dodge'],
+      walk: ['walk', 'turn'],
+      run: ['run', 'dash', 'slide'],
+      jump: ['jumpsquat', 'air', 'land', 'landlag', 'entry', 'respawn', 'airdodge', 'ledge'],
+      attack: ['attack', 'special', 'throw', 'grabbing'],
+      hitstun: ['hitstun', 'tumble', 'helpless', 'broken', 'grabbed', 'lose'],
+      victory: ['victory']
+    },
+
+    /* Poids de chaque articulation dans la distance entre deux poses
+       (degrés pour les angles, pixels pour hipY). */
+    POIDS: {
+      torso: 1.2, head: 0.4, headX: 0.5, headY: 0.5, lean: 0.5,
+      shL: 1, elL: 0.8, shR: 1, elR: 0.8,
+      hpL: 1, knL: 0.8, hpR: 1, knR: 0.8,
+      hipY: 2.5, tail: 0.1, wing: 0.1, mouth: 4, eye: 4
+    },
+
+    /* L'export des poses (voir `exporterPoses`). `periode` en images
+       de jeu : on échantillonne un cycle complet. */
+    EXPORT: {
+      idle: { pose: 'idle', periode: 2 * Math.PI / 0.06, n: 16, boucle: true },
+      walk: { pose: 'walk', periode: 2 * Math.PI / 0.20, n: 12, boucle: true },
+      run: { pose: 'run', periode: 2 * Math.PI / 0.32, n: 10, boucle: true },
+      jump: { suite: [['jumpSquat', 1], ['airMonte', 4], ['airDescend', 4], ['land', 1]], boucle: false },
+      hitstun: { suite: [['hurt', 6], ['tumble', 1]], boucle: true },
+      victory: { pose: 'victory', periode: 2 * Math.PI / 0.11, n: 12, boucle: true }
+    },
+    /* les attaques rendues par défaut : une animation `attack_<nom>`
+       par entrée, échantillonnée sur ATTAQUE_IMAGES images */
+    ATTAQUES: ['jab1', 'ftilt', 'fsmash', 'usmash', 'dsmash', 'nair', 'fair', 'dair'],
+    ATTAQUE_IMAGES: 8
+  };
+
+  /* ------------------------------------------------------------
+     LE SQUELETTE D'UN PERSONNAGE
+     Les mêmes longueurs que `drawFighterRig`, recalculées ici pour
+     placer la tête et les ancres sans dessiner le squelette.
+     ------------------------------------------------------------ */
+  function rigDe(ch) {
+    const B = ch.build || {};
+    const bw = B.width || 1, bh = B.height || 1, ht = B.headScale || 1;
+    const th = RIG.thigh * bh * (B.leg || 1), sh = RIG.shin * bh * (B.leg || 1);
+    return {
+      bw, bh,
+      torsoLen: RIG.torsoLen * bh * (B.torso || 1),
+      headR: RIG.headR * ht,
+      shoulderW: RIG.shoulderW * bw,
+      upArm: RIG.upArm * bh * (B.arm || 1), foreArm: RIG.foreArm * bh * (B.arm || 1),
+      hipW: RIG.hipW * bw,
+      thigh: th, shin: sh, legLen: th + sh,
+      neck: RIG.neck * bh,
+      limbW: (B.limbW || 1) * 5.6
+    };
+  }
+
+  /* Les ancres, dans le repère local du squelette (pieds en 0,0,
+     y vers le bas), pour une pose donnée : exactement les formules de
+     `drawFighterRig`. */
+  function ancres(R, p) {
+    const hipY = -R.legLen * 0.92 + (p.hipY || 0);
+    const [cx, cy] = fkPoint(0, hipY, (p.torso || 0) + (p.lean || 0) * 0.4, R.torsoLen);
+    const [hx, hy] = fkPoint(cx, cy, (p.torso || 0) + (p.head || 0) * 0.35, R.neck + R.headR * 0.72);
+    return { hipX: 0, hipY, cx, cy, hx: hx + (p.headX || 0), hy: hy + (p.headY || 0), headR: R.headR, hxBrut: hx, hyBrut: hy };
+  }
+
+  /* ------------------------------------------------------------
+     LE REGISTRE
+     ------------------------------------------------------------ */
+  const planches = Object.create(null);     // id -> { meta, img, pret, familles }
+  const actifs = Object.create(null);       // id -> true | false (bascule manuelle)
+  let avertis = Object.create(null);
+
+  function avertit(cle, msg, e) {
+    if (avertis[cle]) return;
+    avertis[cle] = 1;
+    try { console.warn('Smash Péi — sprites : ' + msg, e || ''); } catch (x) {}
+  }
+
+  function enregistrer(meta) {
+    if (!meta || meta.format !== 'smashpei-sprites/1' || !meta.perso || !meta.animations) {
+      avertit('format', 'métadonnées ignorées (format inconnu)', meta && meta.format);
+      return false;
+    }
+    const id = meta.perso;
+    /* Ouvert depuis le disque, une image chargée depuis un FICHIER
+       contamine le canevas du jeu : l'exposition automatique (bloc 94)
+       ne peut plus mesurer l'écran, et l'export des clips enregistre un
+       canevas illisible. Une image en data: ne contamine rien — c'est ce
+       que l'assembleur produit par défaut. */
+    if (!meta.imageData && typeof location !== 'undefined' && location.protocol === 'file:') {
+      avertit('file-' + id, '« ' + id + ' » : image séparée refusée en file:// ; relancez ' +
+              'sp_assembler.mjs sans --image-separee (le personnage reste vectoriel)');
+      return false;
+    }
+    const P = { meta, img: new Image(), pret: false, familles: Object.create(null), toutes: [] };
+    for (const nom in meta.animations) {
+      const a = meta.animations[nom];
+      const fam = nom.split('_')[0];
+      for (const fr of a.frames || []) {
+        fr.anim = nom;
+        (P.familles[fam] || (P.familles[fam] = [])).push(fr);
+        P.toutes.push(fr);
+      }
+    }
+    if (!P.toutes.length) { avertit('vide-' + id, 'planche vide pour « ' + id + ' »'); return false; }
+    P.img.onload = () => { P.pret = true; };
+    P.img.onerror = e => avertit('img-' + id, 'image introuvable : ' + P.img.src, e);
+    P.img.src = meta.imageData || (SPRITES_CONFIG.DOSSIER + (meta.image || id + '.png'));
+    planches[id] = P;
+    if (actifs[id] === undefined) actifs[id] = true;
+    return true;
+  }
+
+  function charger(id) {
+    if (!id || typeof document === 'undefined') return;
+    const s = document.createElement('script');
+    s.src = SPRITES_CONFIG.DOSSIER + id + '.sprites.js';
+    s.onerror = () => avertit('js-' + id, 'fichier absent : ' + s.src + ' (le personnage reste vectoriel)');
+    document.head.appendChild(s);
+  }
+
+  function planchePour(ch) {
+    if (!ch) return null;
+    const base = ch.__base || ch;
+    const id = base.id;
+    if (!id || actifs[id] === false) return null;
+    const P = planches[id];
+    return P && P.pret ? P : null;
+  }
+
+  /* ------------------------------------------------------------
+     LA POSE LA PLUS PROCHE
+     ------------------------------------------------------------ */
+  const CLES = Object.keys(SPRITES_CONFIG.POIDS);
+  function distance(a, b, seuil) {
+    let d = 0;
+    for (const k of CLES) {
+      const av = a[k] !== undefined ? a[k] : REST[k];
+      const bv = b[k] !== undefined ? b[k] : REST[k];
+      const e = (av - bv) * SPRITES_CONFIG.POIDS[k];
+      d += e * e;
+      if (d > seuil) return d;               // on arrête dès qu'on a perdu
+    }
+    return d;
+  }
+
+  const FAMILLE_ETAT = Object.create(null);
+  for (const fam in SPRITES_CONFIG.FAMILLES)
+    for (const e of SPRITES_CONFIG.FAMILLES[fam]) FAMILLE_ETAT[e] = fam;
+
+  let courant = null;                        // le combattant en cours de dessin
+
+  function choisitImage(P, pose, ch) {
+    let liste = P.toutes;
+    const f = courant;
+    if (f && f.char === ch && f.state) {
+      const fam = FAMILLE_ETAT[f.state];
+      /* une attaque : on essaie d'abord l'animation du coup lui-même */
+      if (fam === 'attack' && f.move && f.move.anim && P.meta.animations['attack_' + f.move.anim])
+        liste = P.meta.animations['attack_' + f.move.anim].frames;
+      else if (fam && P.familles[fam]) liste = P.familles[fam];
+    }
+    let best = null, bd = Infinity;
+    for (const fr of liste) {
+      const d = distance(pose, fr.pose || REST, bd);
+      if (d < bd) { bd = d; best = fr; }
+    }
+    return best;
+  }
+
+  /* ------------------------------------------------------------
+     LA PEAU : l'écart de couleur, en filtre
+     ------------------------------------------------------------ */
+  const FILTRE_OK = (function () {
+    try { const c = document.createElement('canvas').getContext('2d'); return c && 'filter' in c; }
+    catch (e) { return false; }
+  })();
+  const _filtres = new WeakMap();
+  function filtrePeau(ch) {
+    if (!FILTRE_OK) return 'none';
+    const base = ch.__base || ch;
+    if (!ch.pal || !base.pal || ch.pal === base.pal) return 'none';
+    if (_filtres.has(ch)) return _filtres.get(ch);
+    let f = 'none';
+    try {
+      const k = ch.pal.skin ? 'skin' : 'cloth';
+      const a = base.pal[k], b = ch.pal[k];
+      if (a && b && a !== b) {
+        const A = rgb2hsl(...hex2rgb(a)), Bc = rgb2hsl(...hex2rgb(b));
+        const dh = Math.round(Bc[0] - A[0]);
+        const sat = A[1] > 0.02 ? clamp(Bc[1] / A[1], 0, 3) : 1;
+        const lum = A[2] > 0.02 ? clamp(Bc[2] / A[2], 0.2, 3) : 1;
+        f = `hue-rotate(${dh}deg) saturate(${sat.toFixed(2)}) brightness(${lum.toFixed(2)})`;
+      }
+    } catch (e) { f = 'none'; }
+    _filtres.set(ch, f);
+    return f;
+  }
+
+  /* ------------------------------------------------------------
+     LE DESSIN
+     ------------------------------------------------------------ */
+  function dessineSprite(ctx, ch, pose, opt, P) {
+    const meta = P.meta;
+    const fr = choisitImage(P, pose, ch);
+    if (!fr) return null;
+    const R = rigDe(ch);
+    const S = opt.scale !== undefined ? opt.scale : 1;
+    const e = meta.echelle || 1;              // pixels de planche par pixel de jeu
+    const f = ch.features || {};
+    const Pal = ch.pal || {};
+    const An = ancres(R, fr.pose || REST);
+
+    ctx.save();
+    ctx.scale(S, S);
+    /* les mêmes transformations que le squelette vectoriel */
+    ctx.translate(pose.hipX || 0, 0);
+    ctx.scale(pose.sx || 1, pose.sy || 1);
+    const hipY = -R.legLen * 0.92 + (fr.pose ? fr.pose.hipY || 0 : 0);
+    ctx.save();
+    ctx.translate(0, hipY);
+    ctx.rotate(rad(pose.hipRot || 0));
+    ctx.translate(0, -hipY);
+
+    /* 1) derrière le corps : les objets de dos du vestiaire */
+    const gab = (R.bw + R.bh) / 2;
+    const baseF = ((ch.__base || ch).features) || {};
+    if (f.back && f.back !== baseF.back && typeof drawBackItem === 'function')
+      drawBackItem(ctx, An.hipX, An.hipY, An.cx, An.cy, pose, Pal, f.back, gab);
+    if (f.backX && typeof COS_DOS === 'function')
+      COS_DOS(ctx, An.hipX, An.hipY, An.cx, An.cy, pose, Pal, f.backX, gab);
+
+    /* 2) le corps */
+    const filtre = filtrePeau(ch);
+    if (filtre !== 'none') ctx.filter = filtre;
+    ctx.drawImage(P.img, fr.x, fr.y, fr.w, fr.h, -fr.ox / e, -fr.oy / e, fr.w / e, fr.h / e);
+    if (opt.flash > 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha *= clamp(opt.flash, 0, 1);
+      ctx.drawImage(P.img, fr.x, fr.y, fr.w, fr.h, -fr.ox / e, -fr.oy / e, fr.w / e, fr.h / e);
+    }
+    ctx.restore();                           // rotation du bassin, filtre, flash
+    ctx.save();
+    ctx.translate(0, hipY); ctx.rotate(rad(pose.hipRot || 0)); ctx.translate(0, -hipY);
+
+    /* 3) la tête */
+    if ((meta.tete || 'vectorielle') === 'vectorielle') {
+      /* la VRAIE pose pour la tête : la bouche, les yeux et le
+         clignement restent ceux du moment, pas ceux de l'image */
+      const p2 = Object.assign({}, fr.pose || REST, {
+        head: pose.head, headX: pose.headX, headY: pose.headY, mouth: pose.mouth, eye: pose.eye
+      });
+      const A2 = ancres(R, p2);
+      drawHead(ctx, A2.hx, A2.hy, R.headR, p2, ch, Pal, opt);
+      An.hx = A2.hx; An.hy = A2.hy;
+    } else {
+      /* tête dans le rendu : on pose seulement les crochets étendus,
+         dans le repère de la tête, ajusté au gabarit comme dans drawHead */
+      const p = fr.pose || REST;
+      ctx.save();
+      ctx.translate(An.hx, An.hy);
+      ctx.rotate(rad((p.head || 0) * 0.5 + (p.torso || 0) * 0.3));
+      const FIT = cosFitTete(ch, R.headR, f.head || 'round', f);
+      ctx.translate(FIT.dx, FIT.dy); ctx.scale(FIT.sx, FIT.sy);
+      if (f.cosTete && typeof drawTraitTete === 'function') drawTraitTete(ctx, R.headR, Pal, f.cosTete);
+      if (f.hatX && typeof COS_TETE === 'function') COS_TETE(ctx, R.headR, f, Pal, pose);
+      if (f.faceX && typeof COS_VISAGE === 'function') COS_VISAGE(ctx, R.headR, f, Pal, pose);
+      ctx.restore();
+    }
+    ctx.restore();
+    ctx.restore();
+    /* même valeur de retour que drawFighterRig */
+    return { headX: An.hxBrut, headY: An.hyBrut, headR: R.headR, chestX: An.cx, chestY: An.cy, sprite: fr.anim };
+  }
+
+  const rigOrig = window.drawFighterRig;
+  const rigEnv = function (ctx, ch, pose, opt) {
+    const P = planchePour(ch);
+    if (P) {
+      try {
+        const r = dessineSprite(ctx, ch, pose || REST, opt || {}, P);
+        if (r) return r;
+      } catch (e) {
+        avertit('dessin-' + ((ch.__base || ch).id), 'erreur au dessin, retour au vectoriel', e);
+        actifs[(ch.__base || ch).id] = false;
+      }
+    }
+    return rigOrig.apply(this, arguments);
+  };
+  rigEnv.__v105 = 1;
+  window.drawFighterRig = rigEnv;
+
+  /* Le combat sait QUI il dessine : on le retient le temps du dessin. */
+  if (typeof Fighter !== 'undefined' && Fighter.prototype && Fighter.prototype.draw) {
+    const drawOrig = Fighter.prototype.draw;
+    Fighter.prototype.draw = function () {
+      const av = courant;
+      courant = this;
+      try { return drawOrig.apply(this, arguments); }
+      finally { courant = av; }
+    };
+  }
+
+  /* ------------------------------------------------------------
+     L'EXPORT DES POSES — le point de départ du pipeline.
+     Dans la console du navigateur, le jeu ouvert :
+         SPRITES.exporterPoses('tijean')
+     télécharge `tijean.poses.json`.
+     ------------------------------------------------------------ */
+  function normalise(p) {
+    const o = {};
+    for (const k of POSE_KEYS) {
+      let v = p[k] !== undefined ? p[k] : REST[k];
+      if (k === 'hipX' || k === 'hipRot') v = 0;         // appliqués au dessin
+      if (k === 'sx' || k === 'sy') v = 1;
+      o[k] = Math.round(v * 100) / 100;
+    }
+    return o;
+  }
+
+  function poseNommee(nom, t, ch) {
+    if (nom === 'airMonte') return Poses.air(t, { vy: -1 });
+    if (nom === 'airDescend') return Poses.air(t, { vy: 1 });
+    if (nom === 'victory') return Poses.victory(t, ch);
+    return Poses[nom](t);
+  }
+
+  function exporterPoses(id, options) {
+    const o = options || {};
+    const ch = (typeof CHARS !== 'undefined' && CHARS[id]) || null;
+    if (!ch) throw new Error('personnage inconnu : ' + id);
+    const E = SPRITES_CONFIG.EXPORT;
+    const anims = {};
+    for (const nom in E) {
+      const d = E[nom], poses = [];
+      if (d.suite) {
+        for (const [p, n] of d.suite)
+          for (let i = 0; i < n; i++) poses.push(normalise(poseNommee(p, i * 3, ch)));
+      } else {
+        for (let i = 0; i < d.n; i++) poses.push(normalise(poseNommee(d.pose, (i / d.n) * d.periode, ch)));
+      }
+      anims[nom] = { boucle: !!d.boucle, poses };
+    }
+    const attaques = (o.attaques || SPRITES_CONFIG.ATTAQUES).filter(k => ATK_ANIM[k]);
+    const n = o.imagesAttaque || SPRITES_CONFIG.ATTAQUE_IMAGES;
+    for (const k of attaques) {
+      const poses = [];
+      for (let i = 0; i < n; i++) poses.push(normalise(sampleFrames(ATK_ANIM[k], i / (n - 1))));
+      anims['attack_' + k] = { boucle: false, poses };
+    }
+    const doc = {
+      format: 'smashpei-poses/1',
+      perso: id,
+      nom: ch.nFR || id,
+      tete: (ch.features && ch.features.head) || 'round',
+      rig: rigDe(ch),
+      /* le repère : pieds en (0,0), x vers l'avant, y vers le BAS,
+         angles en degrés, 0 = vers le haut, positif = vers l'avant */
+      cles: POSE_KEYS.slice(),
+      palette: Object.assign({}, ch.pal),
+      animations: anims
+    };
+    if (o.telecharger !== false && typeof document !== 'undefined') {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 1)], { type: 'application/json' }));
+      a.download = id + '.poses.json';
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    }
+    return doc;
+  }
+
+  /* ------------------------------------------------------------
+     L'INTERFACE PUBLIQUE
+     ------------------------------------------------------------ */
+  const SPRITES = window.SPRITES = {
+    __v105: 1,
+    CONFIG: SPRITES_CONFIG,
+    enregistrer,
+    charger,
+    exporterPoses,
+    /* basculer un personnage : SPRITES.actif('tijean', false) le
+       remet en vectoriel sans recharger la page */
+    actif(id, on) { if (on === undefined) return actifs[id] !== false && !!planches[id]; actifs[id] = !!on; return actifs[id]; },
+    estSprite(ch) { return !!planchePour(ch); },
+    liste() { return Object.keys(planches); },
+    _rigDe: rigDe, _ancres: ancres
+  };
+  window.SPRITES_CONFIG = SPRITES_CONFIG;
+
+  /* les planches chargées avant ce module (balise <script> placée
+     plus haut dans la page) attendaient dans une file */
+  if (Array.isArray(window.SPRITES_EN_ATTENTE)) {
+    for (const m of window.SPRITES_EN_ATTENTE) enregistrer(m);
+    window.SPRITES_EN_ATTENTE.length = 0;
+  }
+  for (const id of SPRITES_CONFIG.ACTIFS) charger(id);
+})();
+
 </script>
 </body>
 </html>
