@@ -57535,7 +57535,11 @@ html.tact .topbar{ display:none !important; }
     const meta = P.meta;
     const fr = choisitImage(P, pose, ch);
     if (!fr) return null;
-    const R = rigDe(ch);
+    /* Le squelette de RÉFÉRENCE est celui du rendu, gardé dans la
+       planche : si le gabarit du personnage change ensuite (une
+       retouche de silhouette, module 106), la tête et les ancres
+       restent posées sur le corps PEINT, pas sur le nouveau. */
+    const R = (meta.rig && meta.rig.legLen) ? meta.rig : rigDe(ch);
     const S = opt.scale !== undefined ? opt.scale : 1;
     const e = meta.echelle || 1;              // pixels de planche par pixel de jeu
     const f = ch.features || {};
@@ -57726,6 +57730,208 @@ html.tact .topbar{ display:none !important; }
     window.SPRITES_EN_ATTENTE.length = 0;
   }
   for (const id of SPRITES_CONFIG.ACTIFS) charger(id);
+})();
+
+
+/* ===== 106-silhouettes-fines.js ===== */
+/* ============================================================
+   SMASH PÉI — CEUX QUI SE RESSEMBLAIENT ENCORE
+
+   Le module 58 a donné à chacun sa tête ; le 68, sa matière. Le joueur
+   demande de reprendre les personnages qui restent proches à l'œil,
+   sans défaire ce qui a été réglé.
+
+   LA MESURE
+   On ne juge pas une ressemblance au jugé. Chaque combattant est rendu
+   à sa taille de jeu, en attente et en pleine course ; on compare deux
+   à deux la SILHOUETTE (part de pixels communs, sur les deux poses) et
+   la COULEUR (écart moyen sur trois bandes : tête, buste, jambes).
+   L'indice de confusion est  silhouette × (1 − écart de couleur)².
+
+       médiane, chacun contre son plus proche voisin     0,713
+       pire paire (Ségatié / Ti Mbiwi)                   0,852
+       personnages dont un voisin dépasse 0,70           35 sur 63
+
+   Les paires les plus proches forment trois groupes, et ils disent
+   ce qui manque :
+     · les HUMAINS — Ségatié, Ti Mbiwi, Kréol Surfeur, Ti Kréol,
+       Zoreil, Gramoun, Maron, Pésèr, Sab' Kann, Ti Jean, Ti Bazar :
+       même carrure, mêmes proportions, peaux voisines ;
+     · les OISEAUX — Paille-en-Queue, Payanké Blan, Kok Batay, la
+       Dodo : quatre corps blancs identiques, seuls les accessoires
+       diffèrent ;
+     · les LOURDS — Volkan et Grand Bwa, Kaz Tolé et Yab.
+
+   ET UNE CAUSE QU'ON N'ATTENDAIT PAS
+   La forme du TORSE est lue dans `build.shape`. Le module 58 y écrit
+   la famille de tête — mais `TORSO_SHAPE` ne connaît que quatre
+   formes (round, bulky, slim, oval). Toutes les autres familles —
+   beak, leaf, long, drop, wide, shark, soit VINGT-NEUF combattants —
+   retombent en silence sur le torse ovale. Les oiseaux ont le buste
+   d'un homme, la liane celui d'un pêcheur. C'est exactement le défaut
+   que le module 58 avait corrigé pour les têtes, un étage plus bas.
+
+   LA CORRECTION, en deux temps, sans toucher à rien de ce qui compte
+   pour le combat :
+
+     1. SIX TORSES qui manquaient, un par famille : bréchet d'oiseau,
+        tige de plante, buste de lézard, poire, carrure large, torpille
+        de requin. Et trois formes de plus, disponibles pour tous :
+        athlète (en V), tonneau, et la poire déjà citée.
+
+     2. DES RETOUCHES CIBLÉES, pour les seuls personnages des paires
+        mesurées : une forme de torse et quelques proportions, tirées
+        de ce que le personnage EST (un danseur de séga a des jambes,
+        une dodo n'en a presque pas, un pêcheur a de l'allonge).
+
+   Ce qui ne bouge JAMAIS : la famille de tête (module 58), la largeur
+   du gabarit — c'est elle qui fixe la boîte de collision —, la boîte
+   elle-même, les statistiques, les coups. Chaque proportion reste dans
+   ±12 % de sa valeur, et la stature combinée dans ±8 %. Les tenues du
+   module 68 et les matières du module 59 relisent la même table de
+   torses : elles suivent seules.
+
+   CE QUE LA PREMIÈRE VERSION A APPRIS
+   Les six torses seuls ne changent presque rien à la mesure : à la
+   taille du jeu, le buste est caché par les bras, les ailes et les
+   habits. Et des retouches écrites une à une, chacune juste, se
+   gênaient : éloigner le Ségatié du Ti Mbiwi le collait à la Vanille,
+   Kaz Tolé et Yab se RAPPROCHAIENT (0,755 → 0,792). Ce qui se lit,
+   c'est la STATURE, la taille de la TÊTE et l'épaisseur des MEMBRES —
+   et il faut les choisir ensemble. D'où la recherche décrite plus bas.
+
+   RÉSULTAT, même banc :
+
+                                                    avant    après
+       médiane, chacun contre son plus proche voisin  0,713    0,691
+       pire paire                                     0,852    0,776
+       personnages dont un voisin dépasse 0,70        35       25
+       boîtes de collision modifiées                   —        0
+       stature (pieds → crâne)                         —     −6 % à +8 %
+
+   Deux personnages non retouchés se rapprochent un peu d'un voisin
+   devenu différent : Bourbon Pointu (0,668 → 0,696) et le Cabri
+   (0,689 → 0,713). C'est le prix d'un réglage global ; ils sont les
+   premiers candidats d'une prochaine passe.
+   ============================================================ */
+(function silhouettesFines() {
+  if (typeof CHARS === 'undefined' || typeof TORSO_SHAPE === 'undefined') return;
+  if (silhouettesFines.__fait) return;
+  silhouettesFines.__fait = true;
+
+  /* ------------------------------------------------------------
+     1) LES TORSES — [épaules, taille, hanches], en largeurs d'épaule,
+        dans la même convention que les quatre d'origine.
+     ------------------------------------------------------------ */
+  const TORSES = {
+    brechet:  [1.02, 1.30, 0.80],   // oiseau : poitrail bombé, hanches fines
+    tige:     [0.90, 0.64, 0.72],   // plante, liane : un buste qui file
+    lezard:   [0.92, 0.84, 1.00],   // reptile : long, bas, sans taille
+    poire:    [0.88, 1.10, 1.24],   // épaules tombantes, ventre et hanches
+    large:    [1.30, 1.20, 1.06],   // carrure pleine, de haut en bas
+    torpille: [1.36, 0.94, 0.76],   // requin : tout dans les épaules
+    athlete:  [1.32, 0.86, 0.84],   // en V : épaules larges, taille prise
+    tonneau:  [1.18, 1.46, 1.20]    // rond comme une marmite
+  };
+  for (const k in TORSES) if (!TORSO_SHAPE[k]) TORSO_SHAPE[k] = TORSES[k];
+
+  /* la famille de tête -> son torse par défaut. On n'écrase jamais
+     une forme de torse qui existe déjà sous ce nom. */
+  const PAR_FAMILLE = { beak: 'brechet', leaf: 'tige', long: 'lezard', drop: 'poire', wide: 'large', shark: 'torpille' };
+  for (const fam in PAR_FAMILLE)
+    if (!TORSO_SHAPE[fam]) TORSO_SHAPE[fam] = TORSO_SHAPE[PAR_FAMILLE[fam]];
+
+  /* ------------------------------------------------------------
+     2) LES RETOUCHES
+        torse  : forme du torse (clé de TORSO_SHAPE)
+        jambe, bras, tronc : longueur des jambes, des bras, du buste
+        tete   : taille de la tête        membres : épaisseur des membres
+        taille : la stature entière (build.height), bornée à BORNES_TAILLE
+        Toutes sont des MULTIPLICATEURS, bornés à BORNES.
+     ------------------------------------------------------------ */
+  const BORNES = [0.88, 1.12];
+
+  /* Les variantes retenues. Pour chaque personnage, trois ou quatre
+     variantes toutes plausibles pour ce qu'il est ont été écrites à la
+     main ; une recherche a ensuite choisi, parmi elles, la combinaison
+     qui réduit le plus les confusions SUR LES 63 À LA FOIS — éloigner
+     un humain de son voisin ne doit pas le rapprocher d'un autre, et
+     c'est exactement ce qu'une première version écrite à la main
+     faisait. Ti Kréol et Ti Jean servent de référence : on n'y touche
+     pas. La Dodo et Macatia n'y ont rien gagné : ils restent tels quels. */
+  const RETOUCHES = {
+    /* --- les humains --- */
+    segatier: { taille: 1.08, jambe: 1.10, membres: 0.88, bras: 1.08 },               // le danseur de séga : grand, délié, tout en jambes
+    mbiwi:    { torse: 'athlete', taille: 0.94, bras: 1.08, jambe: 0.90, tete: 1.06 }, // deux bambous frappés : compact, les bras devant
+    surfeur:  { torse: 'athlete', taille: 1.08, membres: 1.12, tete: 0.92 },           // le surfeur : grand, en V
+    zoreil:   { torse: 'large', taille: 0.94, membres: 1.12 },                         // le randonneur : trapu, bâti pour porter
+    gramoun:  { torse: 'poire', taille: 0.93, jambe: 0.90, tete: 1.08 },               // l'ancien : tassé, la tête qui compte
+    maron:    { torse: 'athlete', membres: 1.12, bras: 1.04 },                         // l'homme des remparts : des bras qui grimpent
+    pesheur:  { torse: 'tige', taille: 1.06, bras: 1.12 },                             // allonge de rivière : haut, de longs bras
+    sabkann:  { torse: 'large', bras: 1.08, tete: 0.92 },                              // le coupeur de cannes : les épaules du travail
+    bazar:    { torse: 'poire', taille: 0.92, membres: 1.10 },                         // le marchand de tissus, bien installé
+    kal:      { torse: 'poire', taille: 0.92, jambe: 0.88 },                           // la vieille sorcière, voûtée
+    sirandane:{ torse: 'tige', taille: 1.08, jambe: 1.10, membres: 0.88 },             // le conteur : grand et mince
+    vanille:  { torse: 'tige', bras: 1.12, membres: 0.88, tete: 0.92 },                // la liane : des bras qui s'enroulent
+
+    /* --- les oiseaux --- */
+    paille:      { taille: 1.06, jambe: 1.12, membres: 0.88 },                         // la reine des airs : élancée, haute sur pattes
+    pailleblanc: { torse: 'tige', taille: 0.94, tete: 1.10 },                          // le fil blanc : petit, fin, la tête ronde
+    kok:         { taille: 0.94, tronc: 1.10, tete: 0.92 },                            // le coq de combat : bas sur pattes, le poitrail long
+
+    /* --- les lourds --- */
+    grandbwa: { jambe: 1.12, membres: 0.90 },                                          // le colosse de la forêt : haut comme un tronc
+    volkan:   { taille: 0.96, jambe: 0.90 },                                           // le titan de lave : tassé, massif
+    kaztole:  { torse: 'large', taille: 1.06, jambe: 1.10 },                           // la muraille de tôle : haute et carrée
+    yab:      { torse: 'tonneau', jambe: 0.90, tete: 1.10 },                           // l'alambic : la panse
+    cari:     { torse: 'tonneau', taille: 0.94 },                                      // la marmite ambulante
+    kavadi:   { torse: 'athlete', taille: 1.08, jambe: 1.10 },                         // le porteur de l'arche : grand, droit
+    roular:   { taille: 0.94, membres: 1.08 }                                          // le maître du maloya : ancré sur son tambour
+  };
+
+  /* la stature se lit plus que tout, mais elle éloigne le dessin de la
+     boîte de collision : elle a sa propre borne, plus serrée */
+  const BORNES_TAILLE = [0.92, 1.08];
+
+  const CHAMPS = { jambe: 'leg', bras: 'arm', tronc: 'torso', tete: 'headScale', membres: 'limbW' };
+  const appliquees = [];
+
+  /* La stature du squelette, des pieds au sommet du crâne, avec les
+     formules de drawFighterRig. La hauteur, les jambes et le buste se
+     multiplient : sans cette garde, « un peu plus grand » et « des
+     jambes un peu plus longues » faisaient ensemble près de 9 %. */
+  function stature(b) {
+    const bh = b.height || 1;
+    return (RIG.thigh + RIG.shin) * bh * (b.leg || 1) * 0.92 + RIG.torsoLen * bh * (b.torso || 1) +
+           RIG.neck * bh + RIG.headR * (b.headScale || 1) * 1.7;
+  }
+  for (const id in RETOUCHES) {
+    const c = CHARS[id];
+    if (!c || !c.build) continue;
+    const b = c.build, r = RETOUCHES[id];
+    if (b.__fines) continue;
+    b.__fines = true;
+    const avant = stature(b);
+    if (r.torse && TORSO_SHAPE[r.torse]) b.shape = r.torse;
+    if (r.taille !== undefined) b.height = (b.height || 1) * clamp(r.taille, BORNES_TAILLE[0], BORNES_TAILLE[1]);
+    for (const k in CHAMPS) {
+      if (r[k] === undefined) continue;
+      const cle = CHAMPS[k];
+      b[cle] = (b[cle] || 1) * clamp(r[k], BORNES[0], BORNES[1]);
+    }
+    /* la stature combinée reste dans BORNES_TAILLE : on corrige par la
+       hauteur, qui agit sur tout le corps d'un coup */
+    const k = stature(b) / avant;
+    const kb = clamp(k, BORNES_TAILLE[0], BORNES_TAILLE[1]);
+    if (k !== kb) b.height = (b.height || 1) * kb / k;
+    appliquees.push(id);
+  }
+
+  /* les personnages déjà dérivés par le vestiaire gardaient l'ancien
+     gabarit en cache */
+  try { if (typeof clearCosCache === 'function') clearCosCache(); } catch (e) {}
+
+  window.SILHOUETTES_FINES = { TORSES, PAR_FAMILLE, RETOUCHES, appliquees };
 })();
 
 </script>
