@@ -56665,6 +56665,230 @@ html.tact .topbar{ display:none !important; }
   Fighter.prototype.takeHit = env;
 })();
 
+
+/* ===== 103-di.js ===== */
+/* ============================================================
+   SMASH PÉI — LE DI SE JOUE PENDANT LE GEL
+
+   Le joueur demande le DI de Smash : pouvoir infléchir un peu sa
+   trajectoire d'éjection en tenant une direction, sans en prendre
+   le contrôle.
+
+   Le moteur en avait une ébauche, dans `takeHit` :
+
+       ang += stick_horizontal × 15°
+
+   Mesure faite avec une manette simulée, Ti Jean frappant le Volkan
+   à 90 %, angle de sortie relevé à la première image de vol :
+
+       situation                          sans DI   avec   écart
+       éjecté à droite, stick →              40°      56°    +16°  plus vertical
+       éjecté à gauche, stick →             139°     156°    +17°  plus HORIZONTAL
+       éjecté à l'horizontale, stick ↑        0°       0°      0°
+       stick ↑ poussé PENDANT le gel          0°       1°      0°
+       bot de niveau 5, 200 éjections         —        —     0,4° en moyenne
+
+   Quatre défauts :
+
+     1. LE STICK EST LU À L'IMAGE DU COUP. Or tout l'intérêt du gel
+        (module 102), c'est de laisser à la victime le temps de
+        réagir. Pire : `readDI()` relevait bien le stick pendant le
+        gel, dans `this.di` et `this.diY`… et personne ne les lisait.
+
+     2. SEUL L'AXE HORIZONTAL COMPTE. Une éjection horizontale —
+        celle qui tue par les côtés — ne peut pas être infléchie du
+        tout, puisque c'est l'axe VERTICAL qui lui est perpendiculaire.
+
+     3. LE MÊME GESTE A DEUX SENS. Tenir « droite » fait tourner la
+        trajectoire toujours dans le même sens de rotation : vers le
+        haut quand on part à droite, vers le sol quand on part à
+        gauche. Impossible à apprendre.
+
+     4. LES BOTS N'EN FONT JAMAIS, même au niveau 5. Un Zarboutan
+        meurt donc plus tôt qu'un humain moyen.
+
+   LA CORRECTION — celle de Smash, bornée :
+
+     · l'effet du moteur est retiré au moment du coup, pour qu'il ne
+       se cumule pas ;
+     · à la FIN du gel, on lit le stick et on ne garde que sa
+       composante PERPENDICULAIRE à la trajectoire. Tenir dans le
+       sens du vol ou à contresens ne fait rien ; tenir de côté
+       infléchit, au plus de DI.MAX degrés ;
+     · la vitesse d'éjection ne change pas : on tourne le vecteur,
+       on ne l'allonge jamais. La distance parcourue reste celle que
+       l'équilibrage a prévue ; seule la direction bouge ;
+     · les bots font un DI de survie (vers le centre de l'arène),
+       d'autant plus juste et d'autant plus fréquent que leur niveau
+       est élevé. Aux petits niveaux ils se trompent de sens : c'est
+       dans la lignée des défauts calibrés du module 57.
+
+   RÉSULTAT, même banc :
+
+       situation                          sans DI   avec   écart
+       éjecté à droite 44°, stick →          40°      27°    −13°  (seule la
+                                                                  part ⊥ compte)
+       éjecté à l'horizontale, stick ↑        0°      18°    +18°
+       éjecté à l'horizontale, stick ↓        0°     −18°    −18°
+       stick ↑ poussé PENDANT le gel          0°      19°    +18°
+       stick dans le sens du vol             40°      41°      0°
+       éjecté à gauche, stick ⊥ (↗)         139°     120°    −18°
+
+       bots, 200 éjections   tente un DI   bon sens   écart moyen
+       niveau 1                  4 %          56 %        0,5°
+       niveau 3                 40 %          86 %        5,3°
+       niveau 5                 93 %          99 %       14,8°
+
+   La norme de la vitesse ne bouge pas (à la gravité d'une image près).
+
+   LA CHUTE (module 75) : elle ne touche jamais un combattant en
+   HITSTUN ou TUMBLE. Le DI n'agit qu'à l'image du départ, pendant
+   ces états-là : les deux ne peuvent pas se croiser. Contrôlé sur
+   trois matchs de quatre bots de niveau 5 (plus de 16 000 images,
+   441 DI joués) : zéro image où la condamnation s'est déclenchée
+   pendant une éjection.
+   ============================================================ */
+(function diDuGel() {
+  if (typeof Fighter === 'undefined' || !Fighter.prototype || !Fighter.prototype.takeHit) return;
+  if (typeof ST === 'undefined') return;
+  if (Fighter.prototype.takeHit.__di103) return;
+
+  const DI = {
+    MAX: 18,            // degrés, au plus : la valeur de Smash Ultimate
+    ZONE_MORTE: 0.22,   // en deçà, un pouce qui repose ne compte pas
+    /* le DI du moteur d'origine, qu'on retire pour ne pas cumuler */
+    ANCIEN: 15,
+    /* les bots : chance de tenter un DI, et chance de se tromper de
+       sens, lues dans la table des niveaux (champs `tech` et `err`) */
+    BOT_TENTE_MUL: 1.1,
+    BOT_FORCE: 0.9
+  };
+  window.DI_REGLAGES = DI;
+
+  const EJECTION = {};
+  EJECTION[ST.HITSTUN] = 1; EJECTION[ST.TUMBLE] = 1;
+
+  /* Tourne le vecteur vitesse de `deg` degrés, dans le repère du
+     moteur (angles comptés vers le haut, y de l'écran vers le bas). */
+  function tourne(f, deg) {
+    if (!deg) return;
+    const v = Math.hypot(f.vx, f.vy);
+    if (!(v > 0)) return;
+    const a = Math.atan2(-f.vy, f.vx) + deg * Math.PI / 180;
+    f.vx = Math.cos(a) * v;
+    f.vy = -Math.sin(a) * v;
+    f.kbAngle = (f.kbAngle || 0) + deg;
+  }
+
+  /* Le DI d'un stick (x vers la droite, y vers le BAS comme la
+     manette) sur la trajectoire actuelle : composante perpendiculaire,
+     positive = rotation vers la gauche du sens de vol. */
+  function ecartStick(f, sx, sy) {
+    const m = Math.hypot(sx, sy);
+    if (m < DI.ZONE_MORTE) return 0;
+    const k = Math.min(1, m) / m;
+    const ux = sx * k, uy = -sy * k;                 // repère « y vers le haut »
+    const a = Math.atan2(-f.vy, f.vx);
+    const perp = -Math.sin(a) * ux + Math.cos(a) * uy; // stick · normale gauche
+    return clamp(perp, -1, 1) * DI.MAX;
+  }
+
+  function niveauBot(f) {
+    const b = f.cpuBrain;
+    if (b && b.lv) return b.lv;
+    if (typeof AI_LEVELS !== 'undefined') return AI_LEVELS[(f.slot && f.slot.level) || 2] || null;
+    return null;
+  }
+
+  /* Le DI d'un bot : tourner la trajectoire vers le centre de l'arène. */
+  function ecartBot(f) {
+    const L = niveauBot(f);
+    const tente = L ? clamp((L.tech || 0) * DI.BOT_TENTE_MUL, 0, 1) : 0;
+    if (Math.random() >= tente) return 0;
+    const B = f.M && f.M.stage && f.M.stage.bounds;
+    if (!B) return 0;
+    const cx = (B.left + B.right) / 2, cy = (B.top + B.bottom) / 2;
+    const tx = cx - f.x, ty = -(cy - f.y);           // repère « y vers le haut »
+    const vx = f.vx, vy = -f.vy;
+    let sens = Math.sign(vx * ty - vy * tx) || 1;    // produit vectoriel
+    if (L && Math.random() < (L.err || 0)) sens = -sens;
+    return sens * DI.MAX * DI.BOT_FORCE * (0.6 + 0.4 * (L ? (L.tech || 0) : 0));
+  }
+
+  function appliqueDI(f) {
+    f.__diAttente = false;
+    if (!EJECTION[f.state] || !f.alive || f.grabber) return;
+    let ecart;
+    if (f.slot && f.slot.kind === 'cpu') ecart = ecartBot(f);
+    else {
+      /* le stick au moment où le gel se termine */
+      let sx = f.di || 0, sy = f.diY || 0;
+      try { const inp = f.readInput(); sx = inp.ax || 0; sy = inp.ay || 0; } catch (e) {}
+      ecart = ecartStick(f, sx, sy);
+    }
+    tourne(f, ecart);
+    f.__diDernier = ecart;
+  }
+
+  /* ------------------------------------------------------------
+     1) AU COUP : on retire le DI du moteur, et on met le vrai en
+        attente de la fin du gel.
+     ------------------------------------------------------------ */
+  const takeOrig = Fighter.prototype.takeHit;
+  const env = function (src, h, dir, hitPos) {
+    /* Le moteur lit le stick à l'intérieur de l'appel : on relit la
+       même valeur, au même instant, pour annuler exactement son effet. */
+    let ancien = 0;
+    try {
+      if (this.slot && this.slot.kind !== 'cpu' && typeof Input !== 'undefined') {
+        const d = Input.devices[this.slot.device];
+        if (d && d.ax) ancien = clamp(d.ax, -1, 1) * DI.ANCIEN;
+      }
+    } catch (e) {}
+
+    const kbAvant = this.kbAngle, vxAvant = this.vx, vyAvant = this.vy;
+    const r = takeOrig.call(this, src, h, dir, hitPos);
+
+    try {
+      const lance = r && EJECTION[this.state] &&
+                    (this.kbAngle !== kbAvant || this.vx !== vxAvant || this.vy !== vyAvant);
+      if (lance) {
+        if (ancien) tourne(this, -ancien);
+        this.__diAttente = true;
+        /* gel coupé par le joueur : pas d'attente, le DI se joue tout de suite */
+        if (!(this.hitlag > 0)) appliqueDI(this);
+      }
+    } catch (e) {
+      if (!diDuGel.__vu) { diDuGel.__vu = 1; try { console.error('[DI]', e); } catch (e2) {} }
+    }
+    return r;
+  };
+  env.__di103 = 1;
+  for (const k of ['__lis', '__hitlag102']) if (takeOrig[k]) env[k] = takeOrig[k];
+  Fighter.prototype.takeHit = env;
+
+  /* ------------------------------------------------------------
+     2) À LA FIN DU GEL : la première image où le combattant
+        n'est plus figé, avant sa physique.
+     ------------------------------------------------------------ */
+  const majOrig = Fighter.prototype.update;
+  Fighter.prototype.update = function () {
+    if (this.__diAttente && !(this.hitlag > 0)) {
+      try { appliqueDI(this); } catch (e) { this.__diAttente = false; }
+    }
+    return majOrig.apply(this, arguments);
+  };
+
+  /* une mort ou une réapparition annule un DI en attente */
+  const dieOrig = Fighter.prototype.die;
+  if (typeof dieOrig === 'function') {
+    Fighter.prototype.die = function () {
+      this.__diAttente = false;
+      return dieOrig.apply(this, arguments);
+    };
+  }
+})();
+
 </script>
 </body>
 </html>
