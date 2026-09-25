@@ -56889,6 +56889,326 @@ html.tact .topbar{ display:none !important; }
   }
 })();
 
+
+/* ===== 104-juice.js ===== */
+/* ============================================================
+   SMASH PÉI — CHAQUE COUP À SA JUSTE DOSE
+
+   Le joueur demande que les effets suivent la puissance des coups :
+   un jab discret, un smash chargé qui éclaire, secoue et éclabousse.
+
+   Le jeu ne manquait pas d'effets — trois couches s'en occupent déjà
+   (le moteur, le module 50, le module 96). Il manquait une ÉCHELLE.
+   Mesure sur un vrai match, Ti Jean frappant le Volkan, tempo coupé :
+
+       coup                 % cible   tremblement   zoom   flash
+       jab                     0          5,9        0      0
+       tilt avant              0          7,4        0      0
+       aérien avant            0         11,9       0,57    0
+       smash avant             0         16,6       0,90    0
+       smash avant             120       16,6       0,90    0
+       smash CHARGÉ À FOND     0         18,0       1,00    0
+       smash CHARGÉ À FOND     120       18,0       1,00    0
+
+   Trois choses s'y lisent :
+
+     1. LE JAB SECOUE L'ÉCRAN. Six pixels pour une pichenette : à
+        quatre joueurs qui tapent, la caméra ne s'arrête jamais de
+        trembler, et le tremblement ne veut plus rien dire.
+
+     2. UN SMASH CHARGÉ À FOND N'A RIEN DE PLUS qu'un smash sec : 18
+        contre 16,6, même zoom à dix pour cent près, aucun éclair. Le
+        coup le plus risqué du jeu n'est pas récompensé à l'écran.
+
+     3. LA PUISSANCE NE REGARDE QUE LES DÉGÂTS. Un smash qui tue à
+        120 % s'affiche exactement comme le même smash à 0 %, qui fait
+        à peine reculer. Or ce que le joueur ressent, c'est l'ÉJECTION.
+
+   Et deux défauts qu'on trouve en regardant de près :
+
+     4. L'onde de choc du module 50 est orientée sur l'angle BRUT du
+        coup (`h.ang`) : pour tous les coups à angle « 361 » — la
+        moitié du jeu — elle part dans une direction que la victime ne
+        prendra jamais.
+
+     5. LES PARTICULES FANTÔMES. `FX.clear()`, appelé à chaque début
+        de match, vide la liste sans remettre à zéro le drapeau posé par
+        le module 87. Les particules encore à l'écran à la fin d'un
+        match sont alors reprises par le match suivant… et jamais
+        affichées ni mises à jour. Banc : 300 étincelles créées après
+        un `clear`, 300 perdues. Ce sont les premiers impacts du match
+        suivant qui disparaissent.
+
+   LA CORRECTION
+   Une PUISSANCE de 0 à 1 qui mêle les dégâts, la vitesse d'éjection et
+   la charge du smash ; cinq PALIERS, tous réglés dans la table
+   `JUICE` ci-dessous ; et une règle : les couches existantes gardent
+   leur dessin (étoile, onde, éclats), mais le TREMBLEMENT, le ZOOM et
+   l'ÉCLAIR d'un coup qui éjecte sont décidés ici, une seule fois, au
+   lieu d'être le maximum de trois avis différents. S'y ajoute une
+   GERBE au moment où la victime décolle, orientée sur sa vraie
+   trajectoire (DI compris).
+
+   La « dose d'effets » du joueur (module 93) garde le dernier mot : on
+   passe par `Match.shake`, `Match.flash` et `Match.zoomPunch`, qu'elle
+   enveloppe déjà. À zéro, il ne reste ni tremblement ni éclair.
+
+   RÉSULTAT, même banc :
+
+       coup                 % cible   palier   tremb.  zoom  éclair  gerbe
+       jab                   0-120    léger     1,5     0     0       0
+       tilt avant            0-120    léger     1,5     0     0       0
+       aérien avant          0-120    franc     4       0     0      3-10
+       smash avant           0        lourd     8      0,25   0       9
+       smash avant           120      smash    12      0,5   0,12    25
+       smash CHARGÉ À FOND   0-120    éclat    18      0,9   0,3    38-40
+
+   Inchangés, vérifiés au banc : coup dans le bouclier (aucun effet de
+   caméra), parade parfaite (tremblement 6, éclair 0,3, gel punitif de
+   26 images), dose à zéro (tout à zéro). Particules fantômes : 300
+   perdues sur 300 avant, 0 après (les 18 % qui manquent encore sont le
+   tri voulu du réglage de qualité, `FX.q()` = 0,8).
+   ============================================================ */
+(function dosageDesCoups() {
+  if (typeof Fighter === 'undefined' || !Fighter.prototype || !Fighter.prototype.takeHit) return;
+  if (typeof FX === 'undefined' || typeof ST === 'undefined') return;
+  if (Fighter.prototype.takeHit.__juice104) return;
+
+  /* ------------------------------------------------------------
+     LA TABLE — tout le réglage est ici.
+     ------------------------------------------------------------ */
+  const JUICE = {
+    /* La puissance, de 0 à 1 :
+         dégâts / DEGATS_REF  × POIDS_DEGATS
+       + éjection / EJECTION_REF × POIDS_EJECTION
+       + charge du smash (0 à 1) × BONUS_CHARGE */
+    PUISSANCE: {
+      DEGATS_REF: 30, POIDS_DEGATS: 0.6,
+      EJECTION_REF: 30, POIDS_EJECTION: 0.4,
+      BONUS_CHARGE: 0.25
+    },
+
+    /* Les paliers, du plus faible au plus fort. On retient le dernier
+       dont `min` est atteint.
+         tremble : amplitude du tremblement de caméra, en pixels
+         zoom    : coup de zoom (0 à 1)
+         eclair  : éclair blanc plein écran (0 à 1)
+         gerbe   : étincelles projetées au décollage de la victime
+         fumee   : bouffées de fumée au décollage
+         anneau  : onde de choc supplémentaire au décollage */
+    PALIERS: [
+      { nom: 'leger', min: 0,    tremble: 1.5, zoom: 0,    eclair: 0,    gerbe: 0,  fumee: 0, anneau: false },
+      { nom: 'franc', min: 0.2,  tremble: 4,   zoom: 0,    eclair: 0,    gerbe: 4,  fumee: 0, anneau: false },
+      { nom: 'lourd', min: 0.4,  tremble: 8,   zoom: 0.25, eclair: 0,    gerbe: 8,  fumee: 1, anneau: false },
+      { nom: 'smash', min: 0.6,  tremble: 12,  zoom: 0.5,  eclair: 0.12, gerbe: 14, fumee: 2, anneau: true },
+      { nom: 'eclat', min: 0.85, tremble: 18,  zoom: 0.9,  eclair: 0.3,  gerbe: 22, fumee: 4, anneau: true }
+    ],
+
+    /* Deux éclairs à moins de ÉCLAIR_RECHARGE images d'intervalle : le
+       second est ignoré. Dans une mêlée à quatre, une rafale d'éclairs
+       est un vrai risque pour les personnes photosensibles. */
+    ECLAIR_RECHARGE: 24,
+
+    /* La gerbe : vitesse des étincelles, ouverture du cône (radians),
+       durée de vie (images), et couleurs chaudes au cœur du jet. */
+    GERBE: { VITESSE: 7, VITESSE_PUISSANCE: 9, CONE: 0.55, VIE: [12, 24], TAILLE: [2.5, 5.5],
+             COULEURS: ['#ffffff', '#fff3b0', '#ffd166'] },
+    FUMEE: { COULEUR: '#a39a8e' }
+  };
+  window.JUICE = JUICE;
+
+  /* ============================================================
+     0) LES PARTICULES FANTÔMES
+     ============================================================ */
+  if (typeof FX.clear === 'function' && !FX.clear.__juice104) {
+    const clearOrig = FX.clear;
+    const clear = function () {
+      const r = clearOrig.apply(this, arguments);
+      try { for (const p of this.pool) p.__live = 0; } catch (e) {}
+      return r;
+    };
+    clear.__juice104 = 1;
+    FX.clear = clear;
+  }
+
+  /* ============================================================
+     1) DEUX GÉNÉRATEURS DE PLUS
+     Composés des générateurs existants : ils respectent donc le
+     réglage « particules » du joueur, le plafond de 1 400 et le
+     recyclage du pool.
+     ============================================================ */
+
+  /* La gerbe : un cône d'étincelles et de traits projeté dans l'axe
+     `ang` (radians, repère de l'écran). */
+  FX.gerbe = function (x, y, ang, n, p, col) {
+    const G = JUICE.GERBE;
+    for (let i = 0; i < n; i++) {
+      const a = ang + rnd(-G.CONE, G.CONE) * (1 - p * 0.4);
+      const v = rnd(0.5, 1) * (G.VITESSE + p * G.VITESSE_PUISSANCE);
+      const c = i % 4 === 3 && col ? col : pick(G.COULEURS);
+      if (i % 3 === 0) this.streak(x, y, Math.cos(a) * v, Math.sin(a) * v, c, rndi(G.VIE[0], G.VIE[1]), rnd(G.TAILLE[0], G.TAILLE[1]));
+      else this.spark(x, y, Math.cos(a) * v, Math.sin(a) * v, c, rndi(G.VIE[0], G.VIE[1]), rnd(G.TAILLE[0], G.TAILLE[1]));
+    }
+  };
+
+  /* Le panache : des bouffées qui restent en arrière du décollage. */
+  FX.panache = function (x, y, ang, n, col) {
+    for (let i = 0; i < n; i++)
+      this.smoke(x - Math.cos(ang) * i * 10, y - Math.sin(ang) * i * 10, 1, col || JUICE.FUMEE.COULEUR);
+  };
+
+  /* ============================================================
+     2) LA PUISSANCE ET LE PALIER
+     ============================================================ */
+  function charge(src) {
+    const mv = src && src.move;
+    if (!mv || !mv.charge || !mv.charge.max) return 0;
+    return clamp((src.charge || 0) / mv.charge.max, 0, 1);
+  }
+
+  function puissance(dmg, ejection, ch) {
+    const P = JUICE.PUISSANCE;
+    return clamp(dmg / P.DEGATS_REF * P.POIDS_DEGATS +
+                 ejection / P.EJECTION_REF * P.POIDS_EJECTION +
+                 ch * P.BONUS_CHARGE, 0, 1);
+  }
+
+  function palier(p) {
+    let r = JUICE.PALIERS[0];
+    for (const t of JUICE.PALIERS) if (p >= t.min) r = t;
+    return r;
+  }
+  JUICE.puissance = puissance;
+  JUICE.palier = palier;
+
+  /* L'écriture brute du coup de zoom. La caméra porte un accesseur
+     (module 93) qui multiplie toute écriture par la dose : pour
+     RESTAURER une valeur déjà dosée, on la divise d'abord. */
+  function ecritZoomBrut(cam, v) {
+    const d = Object.getOwnPropertyDescriptor(cam, 'punch');
+    if (d && d.set) {
+      const dose = (window.CADRE && typeof CADRE.fx === 'number') ? CADRE.fx : 1;
+      cam.punch = dose > 0 ? v / dose : 0;
+    } else cam.punch = v;
+  }
+
+  /* ============================================================
+     3) AU COUP
+     ============================================================ */
+  const orig = Fighter.prototype.takeHit;
+  const env = function (src, h, dir, hitPos) {
+    const M = this.M;
+    const cam = M && M.cam;
+    if (!M || !cam) return orig.call(this, src, h, dir, hitPos);
+
+    /* On écoute les trois couches au lieu de les laisser écrire :
+       tremblement et coup de zoom demandés pendant l'appel sont
+       retenus. Si le coup n'éjecte pas (bouclier, parade, armure), on
+       les rejoue tels quels : rien ne change pour ces cas-là. */
+    let tremble = 0, zoom = 0;
+    const zoomAvant = cam.punch || 0;
+    /* Un contre rappelle `takeHit` à l'intérieur de celui-ci : on
+       note ce qui était posé sur l'instance pour le remettre tel quel. */
+    const aShake = Object.prototype.hasOwnProperty.call(M, 'shake') ? M.shake : null;
+    const aZoom = Object.prototype.hasOwnProperty.call(M, 'zoomPunch') ? M.zoomPunch : null;
+    M.shake = function (v) { if (v > tremble) tremble = v; };
+    M.zoomPunch = function (v) { if (v > zoom) zoom = v; };
+
+    /* L'onde du module 50 : on lui donne l'angle réel d'éjection. */
+    const victime = this;
+    const frappeOrig = FX.frappe;
+    if (typeof frappeOrig === 'function') {
+      FX.frappe = function (x, y, ang, p, col, sol) {
+        if (typeof victime.kbAngle === 'number' && victime.kbSpeed > 0) {
+          const a = victime.kbAngle * Math.PI / 180;
+          ang = Math.atan2(-Math.sin(a), Math.cos(a));
+        }
+        return frappeOrig.call(this, x, y, ang, p, col, sol);
+      };
+    }
+
+    const dmgAvant = this.dmgTaken;
+    const kbAvant = this.kbSpeed, vxAvant = this.vx, vyAvant = this.vy;
+    let r;
+    try { r = orig.call(this, src, h, dir, hitPos); }
+    finally {
+      if (aShake) M.shake = aShake; else delete M.shake;
+      if (aZoom) M.zoomPunch = aZoom; else delete M.zoomPunch;
+      if (typeof frappeOrig === 'function') FX.frappe = frappeOrig;
+    }
+
+    try {
+      const lance = r && (this.state === ST.HITSTUN || this.state === ST.TUMBLE) &&
+                    (this.kbSpeed !== kbAvant || this.vx !== vxAvant || this.vy !== vyAvant);
+      if (!lance) {
+        /* comportement d'origine, à l'identique */
+        ecritZoomBrut(cam, Math.max(zoomAvant, cam.punch || 0));
+        if (tremble > 0) M.shake(tremble);
+        if (zoom > 0) M.zoomPunch(zoom);
+        return r;
+      }
+
+      const dmg = Math.max(0, this.dmgTaken - dmgAvant);
+      const p = puissance(dmg, this.kbSpeed || 0, charge(src));
+      const t = palier(p);
+
+      /* le coup de zoom écrit directement par le module 50 est annulé :
+         c'est le palier qui décide */
+      ecritZoomBrut(cam, zoomAvant);
+      if (t.tremble > 0) M.shake(t.tremble);
+      if (t.zoom > 0) M.zoomPunch(t.zoom);
+      if (t.eclair > 0 && (M.frame - (M.__juiceEclair || -999)) >= JUICE.ECLAIR_RECHARGE) {
+        M.__juiceEclair = M.frame;
+        M.flash(t.eclair);
+      }
+
+      /* la gerbe attend le décollage : pendant le gel, les deux corps
+         sont figés, les étincelles partiront avec la victime */
+      this.__juice = { p, t, col: (src && src.color) || this.color };
+      this.__palier = t.nom;
+    } catch (e) {
+      if (!dosageDesCoups.__vu) { dosageDesCoups.__vu = 1; try { console.error('[juice]', e); } catch (e2) {} }
+    }
+    return r;
+  };
+  env.__juice104 = 1;
+  for (const k of ['__lis', '__hitlag102', '__di103']) if (orig[k]) env[k] = orig[k];
+  Fighter.prototype.takeHit = env;
+
+  /* ============================================================
+     4) AU DÉCOLLAGE
+     La première image libre après le gel, une fois le DI appliqué
+     (module 103) et la première image de vol calculée : la
+     direction de la vitesse est la vraie trajectoire.
+     ============================================================ */
+  const majOrig = Fighter.prototype.update;
+  Fighter.prototype.update = function () {
+    const r = majOrig.apply(this, arguments);
+    const j = this.__juice;
+    if (j && !(this.hitlag > 0)) {
+      this.__juice = null;
+      try {
+        if ((this.state === ST.HITSTUN || this.state === ST.TUMBLE) && this.alive) {
+          const a = Math.atan2(this.vy, this.vx);
+          const x = this.cx !== undefined ? this.cx : this.x, y = this.cy !== undefined ? this.cy : this.y;
+          if (j.t.gerbe > 0) FX.gerbe(x, y, a, j.t.gerbe, j.p, j.col);
+          if (j.t.fumee > 0) FX.panache(x, y, a, j.t.fumee);
+          if (j.t.anneau) FX.ring(x, y, 30 + j.p * 40, '#ffffff', 14, 5, 2.4, 0.35, a + Math.PI / 2);
+        }
+      } catch (e) {}
+    }
+    return r;
+  };
+
+  const dieOrig = Fighter.prototype.die;
+  if (typeof dieOrig === 'function') {
+    Fighter.prototype.die = function () {
+      this.__juice = null;
+      return dieOrig.apply(this, arguments);
+    };
+  }
+})();
+
 </script>
 </body>
 </html>
