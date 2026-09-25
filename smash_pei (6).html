@@ -56480,6 +56480,191 @@ html.tact .topbar{ display:none !important; }
   else setTimeout(lancer, 0);
 })();
 
+
+/* ===== 102-hitlag.js ===== */
+/* ============================================================
+   SMASH PÉI — LE MÊME GEL POUR LES DEUX
+
+   Le joueur demande le « freeze-frame » de Smash : un arrêt très
+   court au moment où le coup touche, proportionnel à sa puissance,
+   pour l'attaquant ET pour la victime.
+
+   Le jeu en avait déjà un (`hitlag`, `Match.impact`). Il ne manquait
+   pas le gel : c'est sa règle qui était fausse. Mesure faite sur un
+   vrai match, Ti Jean frappant le Volkan, coups réels du moteur :
+
+       coup              dégâts   gel victime   gel attaquant
+       jab                 3,8          2              2
+       tilt avant          6,9          3              2
+       aérien avant       16           10              8
+       aérien bas         15,1         15             12
+       smash avant        25,2         26             14
+       smash chargé       35,3         35             14
+       projectile à 600 px  7,7         6              5
+
+   Trois défauts s'y lisent :
+
+     1. LES DEUX CORPS NE SONT PAS GELÉS LE MÊME TEMPS. La victime
+        suit une formule, l'attaquant une autre, plafonnée à 14. Sur
+        un smash chargé, l'attaquant se remet à bouger VINGT ET UNE
+        images avant que sa cible reparte : il a le temps de se
+        replacer, voire de recommencer, sur une cible encore figée.
+        Dans Smash, les deux gels sont identiques : c'est ce qui fait
+        que les deux corps « se heurtent ».
+
+     2. LE GEL DE LA VICTIME N'A PAS DE PLAFOND : 35 images, plus
+        d'une demi-seconde d'arrêt, sur un smash chargé. Le joueur a
+        le temps de croire que le jeu a sauté.
+
+     3. LE RÉGLAGE « TEMPS D'ARRÊT » DU JOUEUR NE S'APPLIQUE QU'À
+        L'ATTAQUANT. À 50 %, la victime reste figée 26 images sur un
+        smash quand son agresseur n'en fait plus que 11.
+
+   Et un quatrième, plus discret : un projectile qui touche à l'autre
+   bout de l'arène fige celui qui l'a lancé. Dans Smash, le tireur
+   n'est jamais gelé par un coup qui l'a quitté.
+
+   LA CORRECTION
+   Une seule formule, dans la table `HITLAG` ci-dessous, appliquée
+   aux deux combattants :
+
+       gel = (BASE + dégâts × PAR_DEGAT) × multiplicateur du coup
+             × réglage du joueur,   borné à PLAFOND
+
+   C'est la forme de celle de Smash Ultimate (6 + 0,65 × dégâts),
+   recalibrée parce que les dégâts de Smash Péi sont environ deux
+   fois plus élevés que ceux de Smash. Le multiplicateur propre à
+   chaque coup (`h.hitlag`, déjà réglé coup par coup et par les
+   signatures du module 47) est respecté mais adouci, pour qu'un
+   ×1,7 de signature ne suffise pas à toucher le plafond.
+
+   Ce qui NE change PAS :
+     · le gel global (`Match.hitstop`) des K.O., supers, parades et
+       boucliers brisés ;
+     · le gel sur bouclier, la parade parfaite (26 images punitives,
+       voulues), les armures et le super en cours ;
+     · la boucle à pas fixe : on ne fait que régler un compteur que
+       `Fighter.update` décompte déjà, image par image ;
+     · les replays, qui enregistrent des positions et non des
+       entrées, et le jeu en ligne, où l'hôte calcule ce compteur et
+       le transmet déjà (champ 20 de l'instantané).
+   ============================================================ */
+(function hitlagCommun() {
+  if (typeof Fighter === 'undefined' || !Fighter.prototype || !Fighter.prototype.takeHit) return;
+  if (typeof ST === 'undefined') return;
+  if (Fighter.prototype.takeHit.__hitlag102) return;
+
+  /* ------------------------------------------------------------
+     LA TABLE — tout le réglage est ici.
+     Valeurs obtenues avec le même banc que la mesure ci-dessus :
+
+       coup              dégâts   gel (attaquant = victime)
+       jab                 3,8        4
+       tilt avant          6,9        5
+       aérien avant       16          9
+       aérien bas         15,1       11
+       smash avant        25,2       16
+       smash chargé       35,3       20 (plafond)
+       lancer avant       12          8
+       projectile          7,7        6, tireur non gelé
+
+     Le réglage « temps d'arrêt » du joueur s'applique désormais aux
+     deux : à 50 %, le smash avant fige chacun 8 images ; à 0 %, plus
+     aucun gel.
+     ------------------------------------------------------------ */
+  const HITLAG = {
+    BASE: 4,            // images de gel d'un coup sans dégâts
+    PAR_DEGAT: 0.30,    // images ajoutées par point de dégât
+    PLANCHER: 1,        // un coup qui touche se sent toujours
+    PLAFOND: 20,        // un tiers de seconde, jamais plus
+    /* le multiplicateur du coup est ramené vers 1 : 1,7 → 1,42 */
+    DOUCEUR_MUL: 0.6,
+    /* un coup électrique fige plus longtemps, comme dans Smash */
+    MUL_FX: { shock: 1.5 },
+    /* au-delà de cette distance entre les deux corps, l'attaquant
+       n'a pas porté le coup lui-même (projectile, invocation) : il
+       n'est pas gelé */
+    CONTACT: 170
+  };
+  window.HITLAG = HITLAG;
+
+  function reglageJoueur() {
+    const v = (typeof Save !== 'undefined' && Save.data && Save.data.opts) ? Save.data.opts.hitstop : 1;
+    return (typeof v === 'number' && isFinite(v)) ? v : 1;
+  }
+
+  /* La durée du gel, pour des dégâts RÉELLEMENT infligés (après
+     tous les multiplicateurs du moteur : règles, objets, solo…). */
+  function dureeGel(dmg, h) {
+    const brut = (h && typeof h.hitlag === 'number') ? h.hitlag : 1;
+    const mul = 1 + (brut - 1) * HITLAG.DOUCEUR_MUL;
+    const fx = (h && HITLAG.MUL_FX[h.fx]) || 1;
+    const opt = reglageJoueur();
+    if (opt <= 0) return 0;                       // le joueur a coupé le gel
+    const v = Math.round((HITLAG.BASE + dmg * HITLAG.PAR_DEGAT) * mul * fx * opt);
+    return clamp(v, HITLAG.PLANCHER, HITLAG.PLAFOND);
+  }
+  HITLAG.duree = dureeGel;
+
+  /* Le coup vient-il du corps de l'attaquant ? Un coup de la boucle
+     de collisions porte sa boîte (`h.box`) : c'est un coup au
+     contact. Les autres (projectiles, prises de commande, lancers,
+     glissades) sont jugés à la distance. */
+  function auContact(src, cible, h) {
+    if (!src || src === cible || typeof src.hitlag !== 'number' || !src.takeHit) return false;
+    if (h && h.box) return true;
+    const dx = (src.cx !== undefined ? src.cx : src.x) - (cible.cx !== undefined ? cible.cx : cible.x);
+    const dy = (src.cy !== undefined ? src.cy : src.y) - (cible.cy !== undefined ? cible.cy : cible.y);
+    return dx * dx + dy * dy <= HITLAG.CONTACT * HITLAG.CONTACT;
+  }
+
+  const orig = Fighter.prototype.takeHit;
+  const env = function (src, h, dir, hitPos) {
+    /* On ne corrige QUE l'éjection. Pour la reconnaître sans deviner,
+       on écoute le passage en HITSTUN ou TUMBLE pendant l'appel :
+       c'est le seul chemin de `takeHit` qui l'emprunte. Bouclier,
+       parade, armure, contre et super gardent leur propre gel. */
+    let lance = false;
+    const propre = Object.prototype.hasOwnProperty.call(this, 'setState');
+    const ssAvant = this.setState;
+    this.setState = function (s) {
+      if (s === ST.HITSTUN || s === ST.TUMBLE) lance = true;
+      return ssAvant.apply(this, arguments);
+    };
+
+    const dmgAvant = this.dmgTaken;
+    const hlSrcAvant = (src && typeof src.hitlag === 'number') ? src.hitlag : 0;
+    let r;
+    try { r = orig.call(this, src, h, dir, hitPos); }
+    finally {
+      if (propre) this.setState = ssAvant; else delete this.setState;
+    }
+
+    try {
+      if (r && lance && this.alive !== false && this.state !== ST.DEAD) {
+        const dmg = Math.max(0, this.dmgTaken - dmgAvant);
+        const gel = dureeGel(dmg, h);
+        this.hitlag = gel;
+        if (src && typeof src.hitlag === 'number' && src !== this) {
+          /* L'attaquant : le même gel s'il a frappé au contact. Sinon
+             on lui rend exactement ce qu'il avait avant l'appel — le
+             moteur l'avait gelé pour un projectile parti de loin. On
+             garde le plus long des deux quand il vient de toucher
+             plusieurs cibles dans la même image. */
+          src.hitlag = auContact(src, this, h) ? Math.max(hlSrcAvant, gel) : hlSrcAvant;
+        }
+      }
+    } catch (e) {
+      if (!hitlagCommun.__vu) { hitlagCommun.__vu = 1; try { console.error('[hitlag]', e); } catch (e2) {} }
+    }
+    return r;
+  };
+  env.__hitlag102 = 1;
+  /* les marques des enveloppes précédentes restent lisibles */
+  if (orig.__lis) env.__lis = orig.__lis;
+  Fighter.prototype.takeHit = env;
+})();
+
 </script>
 </body>
 </html>
