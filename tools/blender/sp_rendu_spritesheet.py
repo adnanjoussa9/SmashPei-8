@@ -125,6 +125,26 @@ OPTIONS
   --sans-tete         (mode rendu) masque les objets « tete* »
   --tete vectorielle|sprite   écrit dans le manifeste (vectorielle)
   --contour           active Freestyle pour un trait de contour
+  --style classique|ultimate
+                      ultimate : principale chaude, fond froid, deux
+                      contre-jours forts, rendu couleur AgX/Filmic
+                      contraste moyen-fort, ombres douces, occlusion. Voir la
+                      section 4 du script pour les réglages.
+  --contre-jour K     multiplie la force du contre-jour (1.0)
+  --max-images N      ne rend que les N premières images de chaque animation
+                      (pour un essai rapide)
+  --ouvrir FICHIER    ouvre ce .blend avant de travailler ; utile quand on
+                      lance le script depuis le module Python `bpy` plutôt
+                      que depuis l'exécutable blender
+
+LES MATIÈRES SP_*
+-----------------
+Le mode squelette dépose dans le fichier une bibliothèque de matières aux
+couleurs du personnage : SP_peau, SP_peau_ombre, SP_habit, SP_jean,
+SP_accent, SP_cuir, SP_gants, SP_metal, SP_armure, SP_plumes, SP_ecorce.
+Chacune porte son micro-relief procédural (trame du jean, grain du cuir,
+écorce...). Affectez-les à votre modèle : c'est la moitié de l'aspect
+« Ultimate », l'éclairage est l'autre moitié.
 """
 
 import json
@@ -248,7 +268,8 @@ def lit_arguments(argv):
     args = argv[argv.index('--') + 1:] if '--' in argv else []
     o = {'poses': None, 'mode': 'rendu', 'sortie': None, 'unite': 0.01, 'taille': 384,
          'marge': 2.2, 'anims': None, 'mannequin': False, 'sans_tete': False,
-         'tete': 'vectorielle', 'contour': False}
+         'tete': 'vectorielle', 'contour': False, 'style': 'classique',
+         'ouvrir': None, 'max_images': 0}
     i = 0
     while i < len(args):
         a = args[i]
@@ -257,9 +278,9 @@ def lit_arguments(argv):
         elif a.startswith('--') and i + 1 < len(args):
             cle = a[2:].replace('-', '_')
             val = args[i + 1]
-            if cle in ('unite', 'marge'):
+            if cle in ('unite', 'marge', 'contre_jour'):
                 val = float(val)
-            elif cle == 'taille':
+            elif cle in ('taille', 'max_images'):
                 val = int(val)
             elif cle == 'anims':
                 val = [s.strip() for s in val.split(',') if s.strip()]
@@ -321,6 +342,7 @@ def cree_squelette(doc, o):
     obj['smashpei_perso'] = doc['perso']
     obj['smashpei_unite'] = unite
 
+    bibliotheque_materiaux(doc, unite)
     if o['mannequin']:
         cree_mannequin(obj, doc, unite)
 
@@ -329,46 +351,174 @@ def cree_squelette(doc, o):
     print('Smash Péi : squelette enregistré ->', chemin)
 
 
-def materiau(nom, hexa):
-    h = hexa.lstrip('#')
-    rgb = tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)) if len(h) >= 6 else (0.8, 0.8, 0.8)
-    m = bpy.data.materials.new(nom)
+# ---------------------------------------------------------------------------
+# 3) LES MATIÈRES
+#    Une bibliothèque de matières « SP_* » posée dans chaque fichier : l'artiste
+#    les affecte à son modèle au lieu de régler chaque shader à la main. C'est
+#    une grande part de l'aspect « Ultimate » : chaque matière se reconnaît au
+#    premier regard (la trame d'un jean, le grain d'un cuir, le vernis d'une
+#    armure), sans aucune texture peinte.
+# ---------------------------------------------------------------------------
+
+def hexa_rgb(hexa, defaut=(0.8, 0.8, 0.8)):
+    h = (hexa or '').lstrip('#')
+    if len(h) < 6:
+        return defaut
+    # sRGB -> linéaire : les couleurs de la palette du jeu sont en sRGB
+    return tuple(((int(h[i:i + 2], 16) / 255.0 + 0.055) / 1.055) ** 2.4 for i in (0, 2, 4))
+
+
+def entree(noeud, noms, valeur):
+    """Règle la première entrée qui existe : les noms changent entre Blender 3 et 5
+    (« Subsurface » / « Subsurface Weight », « Clearcoat » / « Coat Weight »...)."""
+    for n in noms:
+        if n in noeud.inputs:
+            try:
+                noeud.inputs[n].default_value = valeur
+                return True
+            except (TypeError, ValueError):
+                pass
+    return False
+
+
+# nom : (rugosité, métal, [(entrées, valeur)], relief)
+#   relief : None, ou (type de texture, échelle, force)
+MATIERES = {
+    'peau':        (0.48, 0.0, [(('Subsurface Weight', 'Subsurface'), 0.18), (('Subsurface Scale',), 0.02)], None),
+    'tissu':       (0.86, 0.0, [(('Sheen Weight', 'Sheen'), 0.35)], ('NOISE', 900.0, 0.12)),
+    'jean':        (0.80, 0.0, [(('Sheen Weight', 'Sheen'), 0.2)], ('WAVE', 420.0, 0.25)),
+    'cuir':        (0.42, 0.0, [(('Coat Weight', 'Clearcoat'), 0.15)], ('NOISE', 260.0, 0.18)),
+    'metal':       (0.28, 1.0, [], None),
+    'metal_peint': (0.32, 0.35, [(('Coat Weight', 'Clearcoat'), 0.7), (('Coat Roughness', 'Clearcoat Roughness'), 0.08)], None),
+    'plumes':      (0.72, 0.0, [(('Sheen Weight', 'Sheen'), 0.6)], ('NOISE', 520.0, 0.10)),
+    'ecorce':      (0.90, 0.0, [], ('VORONOI', 60.0, 0.6)),
+    'caoutchouc':  (0.62, 0.0, [], None),
+    'verre':       (0.05, 0.0, [(('Transmission Weight', 'Transmission'), 0.9)], None),
+}
+
+
+def materiau(nom, hexa, genre='tissu', unite=0.01):
+    """Une matière SP_<nom>, de couleur `hexa`, du genre donné (voir MATIERES).
+    L'échelle du relief est exprimée en pixels de jeu, pour rester la même quelle
+    que soit l'unité choisie."""
+    rug, metal, extra, relief = MATIERES.get(genre, MATIERES['tissu'])
+    rgb = hexa_rgb(hexa)
+    m = bpy.data.materials.get(nom) or bpy.data.materials.new(nom)
+    m.use_fake_user = True          # gardée dans le fichier même non affectée
     m.diffuse_color = (*rgb, 1.0)
-    m.use_nodes = True
-    bsdf = m.node_tree.nodes.get('Principled BSDF')
-    if bsdf:
-        bsdf.inputs['Base Color'].default_value = (*rgb, 1.0)
+    try:
+        m.use_nodes = True
+    except AttributeError:
+        pass
+    arbre = m.node_tree
+    bsdf = next((n for n in arbre.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None:
+        bsdf = arbre.nodes.new('ShaderNodeBsdfPrincipled')
+    entree(bsdf, ('Base Color',), (*rgb, 1.0))
+    entree(bsdf, ('Roughness',), rug)
+    entree(bsdf, ('Metallic',), metal)
+    for noms, v in extra:
+        entree(bsdf, noms, v)
+    if genre == 'peau':
+        entree(bsdf, ('Subsurface Radius',), (1.0, 0.35, 0.2))
+    if relief:
+        sorte, echelle, force = relief
+        coord = arbre.nodes.new('ShaderNodeTexCoord')
+        if sorte == 'WAVE':
+            tex = arbre.nodes.new('ShaderNodeTexWave')
+            try:
+                tex.wave_type = 'BANDS'
+                tex.bands_direction = 'DIAGONAL'
+            except (AttributeError, TypeError):
+                pass
+        elif sorte == 'VORONOI':
+            tex = arbre.nodes.new('ShaderNodeTexVoronoi')
+        else:
+            tex = arbre.nodes.new('ShaderNodeTexNoise')
+        entree(tex, ('Scale',), echelle * unite)
+        bosse = arbre.nodes.new('ShaderNodeBump')
+        entree(bosse, ('Strength',), force)
+        entree(bosse, ('Distance',), 0.002)
+        arbre.links.new(coord.outputs['Object'], tex.inputs['Vector'])
+        sortie = tex.outputs.get('Fac') or tex.outputs.get('Distance') or tex.outputs[0]
+        arbre.links.new(sortie, bosse.inputs['Height'])
+        arbre.links.new(bosse.outputs['Normal'], bsdf.inputs['Normal'])
     return m
 
 
-def cree_mannequin(arm_obj, doc, unite):
-    """Des cylindres sur chaque os, une sphère pour la tête : de quoi tester la chaîne."""
+def bibliotheque_materiaux(doc, unite):
+    """Les matières SP_* du personnage, aux couleurs de sa palette."""
     pal = doc.get('palette', {})
-    peau = materiau('SP_peau', pal.get('skin', '#d9a066'))
-    habit = materiau('SP_habit', pal.get('cloth', pal.get('skin', '#3a6ea5')))
+    peau = pal.get('skin', '#d9a066')
+    return {
+        'peau': materiau('SP_peau', peau, 'peau', unite),
+        'peau_ombre': materiau('SP_peau_ombre', pal.get('skin2', peau), 'peau', unite),
+        'habit': materiau('SP_habit', pal.get('cloth', peau), 'tissu', unite),
+        'jean': materiau('SP_jean', pal.get('cloth', '#3a5f9e'), 'jean', unite),
+        'accent': materiau('SP_accent', pal.get('accent', '#e94f37'), 'tissu', unite),
+        'cuir': materiau('SP_cuir', pal.get('shoe', '#5a3a22'), 'cuir', unite),
+        'gants': materiau('SP_gants', pal.get('hand', peau), 'tissu', unite),
+        'metal': materiau('SP_metal', '#c9ccd2', 'metal', unite),
+        'armure': materiau('SP_armure', pal.get('accent', '#d8742a'), 'metal_peint', unite),
+        'plumes': materiau('SP_plumes', pal.get('wing', pal.get('skin', '#f2f2f2')), 'plumes', unite),
+        'ecorce': materiau('SP_ecorce', pal.get('cloth', '#6b4a2e'), 'ecorce', unite),
+    }
+
+
+def cree_mannequin(arm_obj, doc, unite):
+    """Un mannequin en gélules : un cylindre par os, une sphère à chaque
+    articulation, une tête. De quoi tester la chaîne et juger l'éclairage."""
+    mats = bibliotheque_materiaux(doc, unite)
     rig = doc['rig']
-    for pb in arm_obj.data.bones:
-        if pb.name == 'racine':
-            continue
-        longueur = pb.length
-        if pb.name == 'tete':
-            bpy.ops.mesh.primitive_uv_sphere_add(radius=rig['headR'] * unite, segments=24, ring_count=12)
-            ob = bpy.context.active_object
-            ob.name = 'tete_mannequin'
-            ob.location = arm_obj.matrix_world @ pb.head_local
-        else:
-            rayon = rig['limbW'] * unite * (1.6 if pb.name == 'torse' else 0.55)
-            bpy.ops.mesh.primitive_cylinder_add(radius=rayon, depth=longueur, vertices=12)
-            ob = bpy.context.active_object
-            ob.name = 'mannequin_' + pb.name
-            ob.matrix_world = arm_obj.matrix_world @ pb.matrix_local @ Matrix.Translation((0, longueur / 2, 0)) \
-                @ Matrix.Rotation(math.radians(90), 4, 'X')
-        ob.data.materials.append(habit if pb.name in ('torse', 'cuisse.L', 'cuisse.R') else peau)
+    vue = bpy.context.view_layer
+
+    def attache(ob, os_nom, mat):
+        ob.data.materials.append(mat)
+        vue.update()
         mw = ob.matrix_world.copy()
         ob.parent = arm_obj
         ob.parent_type = 'BONE'
-        ob.parent_bone = pb.name
+        ob.parent_bone = os_nom
         ob.matrix_world = mw
+        try:
+            bpy.ops.object.shade_smooth()
+        except RuntimeError:
+            pass
+
+    for pb in arm_obj.data.bones:
+        if pb.name == 'racine':
+            continue
+        debut = arm_obj.matrix_world @ pb.head_local
+        if pb.name == 'tete':
+            bpy.ops.mesh.primitive_uv_sphere_add(radius=rig['headR'] * unite, segments=32, ring_count=16,
+                                                 location=debut)
+            ob = bpy.context.active_object
+            ob.name = 'tete_mannequin'
+            attache(ob, pb.name, mats['peau'])
+            continue
+        longueur = pb.length
+        epais = rig['limbW'] * unite * (1.7 if pb.name == 'torse' else 0.5)
+        bpy.ops.mesh.primitive_cylinder_add(radius=epais, depth=longueur, vertices=20)
+        ob = bpy.context.active_object
+        ob.name = 'mannequin_' + pb.name
+        ob.matrix_world = arm_obj.matrix_world @ pb.matrix_local @ Matrix.Translation((0, longueur / 2, 0)) \
+            @ Matrix.Rotation(math.radians(90), 4, 'X')
+        if pb.name == 'torse':
+            mat = mats['habit']
+        elif pb.name.startswith(('cuisse', 'tibia')):
+            mat = mats['jean']
+        elif pb.name.startswith('pied'):
+            mat = mats['cuir']
+        elif pb.name.startswith('main'):
+            mat = mats['gants']
+        else:
+            mat = mats['peau']
+        attache(ob, pb.name, mat)
+        # l'articulation : une sphère au départ de l'os, qui bouche le raccord
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=epais * 1.02, segments=16, ring_count=8, location=debut)
+        rot = bpy.context.active_object
+        rot.name = 'articulation_' + pb.name
+        attache(rot, pb.name, mat)
 
 
 def pose_armature(arm_obj, pose, rig, unite):
@@ -390,6 +540,100 @@ def pose_armature(arm_obj, pose, rig, unite):
             cles['bouche'].value = max(0.0, min(1.0, float(pose.get('mouth', 0))))
         if 'yeux_fermes' in cles:
             cles['yeux_fermes'].value = max(0.0, min(1.0, 1.0 - float(pose.get('eye', 1))))
+
+
+# ---------------------------------------------------------------------------
+# 4) LE STYLE « ULTIMATE »
+#    Ce qui donne son air aux rendus de Smash Bros Ultimate, appliqué à nos
+#    personnages (on reprend un STYLE, pas un personnage) :
+#      * une lumière principale chaude en avant et en haut, un fond froid et
+#        doux de l'autre côté, et DEUX contre-jours puissants, de dos, qui
+#        posent un liseré clair sur les deux bords — c'est lui qui détache le
+#        personnage du décor ;
+#      * un rendu couleur filmique (AgX, ou Filmic avant Blender 4) au contraste
+#        moyen-fort : des couleurs saturées qui ne brûlent pas ;
+#      * des ombres douces et de l'occlusion ambiante dans les creux ;
+#      * les matières SP_* (section 3), qui portent le micro-relief.
+#    Des soleils plutôt que des lampes : leur intensité ne dépend pas de la
+#    distance, le réglage vaut donc pour un colosse comme pour un oiseau.
+# ---------------------------------------------------------------------------
+
+STYLE_ULTIMATE = {
+    # (nom, couleur, force, rotation en degrés (x, y, z), douceur en degrés)
+    # Un soleil éclaire le long de son axe -Z local. Avec la caméra en -Y et
+    # le personnage tourné vers +X : x > 0 fait venir la lumière de l'avant
+    # (côté caméra), x < 0 de derrière ; z > 0 la place du côté du visage.
+    # Réglages choisis sur rendus comparés dans Blender 5.0 (principale 1,6 à
+    # 4,2, contre-jour 6 à 25) : au-delà de 2 pour la principale, AgX délave
+    # la peau ; en dessous de 14 pour les contre-jours, le liseré disparaît.
+    'lumieres': [
+        ('SP_Principale',  (1.00, 0.90, 0.78), 2.0, (50.0, 0.0, 40.0), 9.0),     # avant, haut, côté visage
+        ('SP_Fond',        (0.70, 0.80, 1.00), 0.5, (65.0, 0.0, -60.0), 25.0),   # avant, côté nuque, froide
+        ('SP_ContreJour',  (0.95, 0.97, 1.00), 25.0, (-85.0, 0.0, 40.0), 2.0),   # dos, liseré côté visage
+        ('SP_ContreJour2', (1.00, 0.93, 0.85), 18.0, (-85.0, 0.0, -40.0), 2.0),  # dos, liseré côté nuque
+    ],
+    'monde': ((0.20, 0.22, 0.26), 0.2),      # couleur, force : l'ambiance des ombres
+    'rendu': ('AgX', ('AgX - Medium High Contrast', 'Medium High Contrast')),
+    'echantillons': 64,
+}
+
+
+def essaie(objet, attribut, valeur):
+    """Pose un réglage s'il existe dans cette version de Blender."""
+    try:
+        setattr(objet, attribut, valeur)
+        return True
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def applique_style_ultimate(scene, force_contre_jour=1.0):
+    S = STYLE_ULTIMATE
+    # les lumières du style remplacent les autres au rendu (on ne supprime rien)
+    for ob in scene.objects:
+        if ob.type == 'LIGHT' and not ob.name.startswith('SP_'):
+            ob.hide_render = True
+    for nom, couleur, force, rot, douceur in S['lumieres']:
+        ob = bpy.data.objects.get(nom)
+        if ob is None:
+            ob = bpy.data.objects.new(nom, bpy.data.lights.new(nom, 'SUN'))
+            scene.collection.objects.link(ob)
+        ob.hide_render = False
+        ob.data.color = couleur
+        ob.data.energy = force * (force_contre_jour if nom.startswith('SP_ContreJour') else 1.0)
+        ob.rotation_euler = tuple(math.radians(a) for a in rot)
+        essaie(ob.data, 'angle', math.radians(douceur))
+
+    monde = scene.world or bpy.data.worlds.new('SP_Monde')
+    scene.world = monde
+    couleur, force = S['monde']
+    essaie(monde, 'color', couleur)
+    try:
+        monde.use_nodes = True
+        fond = next(n for n in monde.node_tree.nodes if n.type == 'BACKGROUND')
+        entree(fond, ('Color',), (*couleur, 1.0))
+        entree(fond, ('Strength',), force)
+    except (AttributeError, StopIteration):
+        pass
+
+    vue, looks = S['rendu']
+    if not essaie(scene.view_settings, 'view_transform', vue):
+        essaie(scene.view_settings, 'view_transform', 'Filmic')
+    for look in looks:
+        if essaie(scene.view_settings, 'look', look):
+            break
+
+    ee = getattr(scene, 'eevee', None)
+    if ee is not None:
+        essaie(ee, 'taa_render_samples', S['echantillons'])
+        essaie(ee, 'use_gtao', True)             # occlusion ambiante (EEVEE 3.x - 4.1)
+        essaie(ee, 'gtao_distance', 0.25)
+        essaie(ee, 'use_soft_shadows', True)
+        essaie(ee, 'use_raytracing', True)       # EEVEE 4.2 et plus
+        essaie(ee, 'use_shadows', True)
+    cy = getattr(scene, 'cycles', None)
+    if cy is not None:
+        essaie(cy, 'samples', 96)
 
 
 def prepare_scene(doc, o):
@@ -426,7 +670,9 @@ def prepare_scene(doc, o):
     cam.location = (0.0, -10.0, centre * o['unite'])
     cam.rotation_euler = (math.radians(90), 0.0, 0.0)
 
-    if not any(ob.type == 'LIGHT' for ob in scene.objects):
+    if o['style'] == 'ultimate':
+        applique_style_ultimate(scene, o.get('contre_jour', 1.0))
+    elif not any(ob.type == 'LIGHT' for ob in scene.objects):
         soleil = bpy.data.objects.new('SP_Soleil', bpy.data.lights.new('SP_Soleil', 'SUN'))
         soleil.data.energy = 3.0
         soleil.rotation_euler = (math.radians(50), math.radians(-20), math.radians(-30))
@@ -458,7 +704,8 @@ def rend(doc, o):
         sous = os.path.join(dossier, nom)
         os.makedirs(sous, exist_ok=True)
         images = []
-        for i, pose in enumerate(anim['poses']):
+        poses = anim['poses'][:o['max_images']] if o['max_images'] else anim['poses']
+        for i, pose in enumerate(poses):
             pose_armature(arm_obj, pose, rig, unite)
             fichier = '%s_%04d.png' % (nom, i)
             scene.render.filepath = os.path.join(sous, fichier)
@@ -470,7 +717,7 @@ def rend(doc, o):
                 'origine': [u.x * o['taille'], (1.0 - u.y) * o['taille']],
                 'pose': pose
             })
-            print('Smash Péi :', nom, i + 1, '/', len(anim['poses']))
+            print('Smash Péi :', nom, i + 1, '/', len(poses))
         manifeste['animations'][nom] = {'boucle': anim.get('boucle', False), 'images': images}
     with open(os.path.join(o['sortie'], 'manifeste.json'), 'w', encoding='utf-8') as f:
         json.dump(manifeste, f, ensure_ascii=False, indent=1)
@@ -484,6 +731,8 @@ def main():
     if doc.get('format') != 'smashpei-poses/1':
         raise SystemExit('Smash Péi : ce fichier ne vient pas de SPRITES.exporterPoses().')
     os.makedirs(o['sortie'], exist_ok=True)
+    if o['ouvrir']:
+        bpy.ops.wm.open_mainfile(filepath=os.path.abspath(o['ouvrir']))
     if o['mode'] == 'squelette':
         cree_squelette(doc, o)
     else:
