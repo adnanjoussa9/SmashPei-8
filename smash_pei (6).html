@@ -57318,11 +57318,18 @@ html.tact .topbar{ display:none !important; }
   const SPRITES_CONFIG = {
     /* dossier des planches, relatif au fichier HTML */
     DOSSIER: 'sprites/',
-    /* identifiants des personnages à charger au démarrage, par
-       exemple ['tijean']. Le module injecte alors
-       `sprites/tijean.sprites.js`. On peut aussi appeler
-       `SPRITES.charger('tijean')` à la main. */
-    ACTIFS: [],
+    /* identifiants des personnages à charger au démarrage. Le module
+       injecte alors `sprites/<id>.sprites.js` ; fichier absent = le
+       personnage reste vectoriel, sans erreur. On peut aussi appeler
+       `SPRITES.charger('id')` à la main, et SPRITES.actif('id', false)
+       pour revenir au vectoriel.
+
+       Ti Jean est le premier combattant modélisé en 3D
+       (tools/blender/sp_modele.py) et rendu en style « Ultimate ».
+       Sa tête est dans le rendu : les chapeaux CLASSIQUES du vestiaire
+       ne s'affichent pas sur lui ; COS_TETE, COS_VISAGE, COS_DOS et les
+       auras, si. */
+    ACTIFS: ['tijean'],
 
     /* Les familles d'animation et les états du combattant qui les
        utilisent. Un état absent de la table cherche dans toute la
