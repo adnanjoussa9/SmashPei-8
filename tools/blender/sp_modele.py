@@ -29,7 +29,10 @@ UTILISATION
   3. Rendre les images, en style Ultimate, tête comprise :
          blender -b rendus/tijean/tijean.blend --python tools/blender/sp_rendu_spritesheet.py -- \\
              --poses rendus/tijean/tijean.poses.json --mode rendu --style ultimate --tete sprite \\
-             --taille 512 --marge 1.8
+             --taille 448 --marge 1.6
+     (131 images ; quelques minutes avec une carte graphique. Sans carte
+     graphique, EEVEE tourne en logiciel : compter environ 40 s par image,
+     et lancer deux Blender en parallèle sur des --anims différentes.)
 
   4. Assembler :  node tools/spritesheet/sp_assembler.mjs rendus/tijean sprites
 
@@ -48,7 +51,9 @@ OPTIONS
 -------
   --poses FICHIER   le .poses.json exporté par le jeu (obligatoire)
   --sortie DOSSIER  par défaut, celui du fichier de poses
-  --lacet DEGRÉS    rotation du corps vers la caméra (35)
+  --lacet DEGRÉS    rotation du corps vers la caméra (30 : presque de profil,
+                    comme en jeu dans Smash ; le visage, lui, se tourne de
+                    TETE_VERS_CAMERA degrés de plus vers le joueur)
   --unite M         mètres par pixel de jeu (0.01)
 """
 
