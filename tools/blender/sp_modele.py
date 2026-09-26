@@ -90,10 +90,20 @@ class Corps:
         """Longueur en pixels de jeu -> mètres."""
         return v * self.unite
 
+    def tourne(self, degres):
+        """(F, L) pivotés autour de la verticale, vers la caméra."""
+        a = math.atan2(-self.F.y, self.F.x) + math.radians(degres)
+        return Vector((math.cos(a), -math.sin(a), 0.0)), Vector((math.sin(a), math.cos(a), 0.0))
+
     def long_os(self, nom, t):
         """Point à la fraction t de l'os `nom` (0 = tête de l'os, 1 = queue)."""
         a, b = self.os[nom]
         return a.lerp(b, t)
+
+
+# Le visage se tourne davantage vers la caméra que le corps : c'est la pose
+# des combattants de Smash en jeu (corps de profil, regard vers le joueur).
+TETE_VERS_CAMERA = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +317,7 @@ def recette_tijean(C):
         'chaussures': SP.materiau('SP_chaussures', '#6a4a30', 'cuir', u),
         'cape': SP.materiau('SP_cape', pal.get('cape', '#9c2b34'), 'tissu', u),
         'dore': SP.materiau('SP_dore', pal.get('accent', '#e8c547'), 'metal', u),
-        'lame': SP.materiau('SP_lame', '#e4ebf2', 'metal', u),
+        'lame': SP.materiau('SP_lame', '#f4f8fc', 'metal', u),
         'poignee': SP.materiau('SP_poignee', '#6b3f1d', 'cuir', u),
         'cheveux': mat_cheveux('SP_cheveux', pal.get('hair', '#2b1d12')),
         'blanc_oeil': mat_oeil('SP_blanc_oeil', '#f3efe6', 0.3),
@@ -316,8 +326,12 @@ def recette_tijean(C):
         'reflet': mat_oeil('SP_reflet', '#ffffff', 0.1, 0.0, 6.0),
         'levres': SP.materiau('SP_levres', '#6a2c22', 'peau', u),
     }
+    # une lame doit se lire de loin : un métal clair, un vernis qui accroche
+    # le contre-jour
     b = next(n for n in M['lame'].node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
-    SP.entree(b, ('Roughness',), 0.16)
+    SP.entree(b, ('Roughness',), 0.22)
+    SP.entree(b, ('Metallic',), 0.75)
+    SP.entree(b, ('Coat Weight', 'Clearcoat'), 0.8)
     b = next(n for n in M['dore'].node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
     SP.entree(b, ('Roughness',), 0.24)
 
@@ -328,10 +342,10 @@ def recette_tijean(C):
     H = lambda t: h0 + (h1 - h0) * t           # hauteur le long du buste
 
     # ---------------- le buste (peau, visible au col et aux épaules)
-    profil = [  # (hauteur, demi-largeur, demi-profondeur, décalage avant)
-        (H(-0.20), 7.5, 6.0, 0.0), (H(-0.05), 10.8, 7.4, 0.2), (H(0.15), 11.2, 7.6, 0.5),
-        (H(0.36), 10.0, 7.0, 0.8), (H(0.58), 11.8, 7.9, 1.2), (H(0.80), 13.2, 8.3, 1.2),
-        (H(0.95), 12.6, 7.2, 0.3), (H(1.06), 8.0, 5.4, -0.4), (H(1.12), 4.6, 4.4, -0.3)]
+    profil = [  # (hauteur, demi-largeur, demi-profondeur, décalage avant) — un buste en tonneau
+        (H(-0.20), 8.0, 7.0, 0.0), (H(-0.05), 11.4, 8.8, 0.3), (H(0.15), 11.8, 9.2, 0.7),
+        (H(0.36), 10.8, 8.8, 1.2), (H(0.58), 12.6, 9.8, 1.8), (H(0.80), 13.8, 10.0, 1.6),
+        (H(0.95), 13.0, 8.6, 0.5), (H(1.06), 8.4, 6.0, -0.4), (H(1.12), 4.8, 4.6, -0.3)]
     def sections_buste(gonfle=0.0, plage=None, pas=None):
         if pas:                      # rééchantillonné finement entre deux hauteurs
             out = []
@@ -360,6 +374,10 @@ def recette_tijean(C):
     lie(C, habille(cou, M['peau']), ['cou', 'tete', 'torse'])
 
     # ---------------- la tête : crâne ovale, mâchoire, joues
+    # Le corps est presque de profil (le combat se lit mieux ainsi, comme en
+    # jeu dans Smash) mais le VISAGE se tourne vers la caméra : on construit
+    # toute la tête dans un repère pivoté de TETE_VERS_CAMERA degrés.
+    F, L = C.tourne(TETE_VERS_CAMERA)
     r = C.rig['headR'] * 0.98
     rf, ru, rl = r * 1.0, r * 1.08, r * 0.93
     def crane(x, y, z):
@@ -374,7 +392,7 @@ def recette_tijean(C):
         if -0.45 < y < 0.0 and x > 0.2:
             kz += 0.04                              # joues
         return kx, ky, kz
-    tete = ellipsoide(C, 'TJ_tete', tete_c, C.px(rf), C.px(ru), C.px(rl), seg=40, anneaux_=24,
+    tete = ellipsoide(C, 'TJ_tete', tete_c, C.px(rf), C.px(ru), C.px(rl), axes=(F, U, L), seg=40, anneaux_=24,
                       deforme=crane)
     lie(C, habille(tete, M['peau']), ['tete'], rigide=True)
 
@@ -389,9 +407,10 @@ def recette_tijean(C):
     # le nez
     pn, nn = surface(-0.10, 0.0)
     pieces_tete.append(habille(ellipsoide(C, 'TJ_nez', pn + nn * C.px(1.0), C.px(r * 0.21),
-                                          C.px(r * 0.18), C.px(r * 0.17), seg=16, anneaux_=8), M['peau']))
+                                          C.px(r * 0.18), C.px(r * 0.17), axes=(F, U, L), seg=16, anneaux_=8),
+                               M['peau']))
     # les yeux : grands, un peu tournés vers la caméra
-    vers_camera = (F * 0.85 - L * 0.35).normalized()
+    vers_camera = (F * 0.92 - L * 0.2).normalized()
     for cote, zl in (('av', -0.36), ('ar', 0.34)):
         po, no = surface(0.13, zl)
         dirn = (no * 0.5 + vers_camera * 0.5).normalized()
@@ -423,11 +442,11 @@ def recette_tijean(C):
     for s_ in (1, -1):
         c_ = tete_c + L * C.px(rl * 0.96 * s_) - F * C.px(r * 0.06) - U * C.px(r * 0.05)
         pieces_tete.append(habille(ellipsoide(C, 'TJ_oreille', c_, C.px(r * 0.2), C.px(r * 0.29),
-                                              C.px(r * 0.09), seg=16, anneaux_=8), M['peau']))
+                                              C.px(r * 0.09), axes=(F, U, L), seg=16, anneaux_=8), M['peau']))
 
     # ---------------- les cheveux : une calotte et des mèches épaisses
     calotte = ellipsoide(C, 'TJ_cheveux', tete_c + U * C.px(r * 0.04), C.px(rf * 1.07),
-                         C.px(ru * 1.05), C.px(rl * 1.08), seg=40, anneaux_=24)
+                         C.px(ru * 1.05), C.px(rl * 1.08), axes=(F, U, L), seg=40, anneaux_=24)
     def garde_cheveux(co):
         d = co - tete_c
         x, y = d.dot(F) / C.px(rf), d.dot(U) / C.px(ru)
@@ -460,6 +479,7 @@ def recette_tijean(C):
                                          (r * ep * 0.45, r * ep * 0.38), (r * 0.02, r * 0.02)], n=10), M['cheveux']))
     for ob in pieces_tete:
         lie(C, ob, ['tete'], rigide=True, lisse=1)
+    F, L = C.F, C.L                              # retour au repère du corps
 
     # ---------------- le gilet : ouvert en V, sans manches
     # Une surface paramétrée plutôt qu'un tube découpé : chaque rangée ne
@@ -527,24 +547,24 @@ def recette_tijean(C):
         lie(C, habille(pp, M['dore']), ['torse'], rigide=True, lisse=1)
     for i, t in enumerate((0.18, 0.32, 0.46)):
         hh = H(t)
-        lw, fd, off = 10.4 + 0.6 * t, 7.3 + 0.9 * t, 0.6 + 0.6 * t
+        lw, fd, off = profil_a(hh)
         bouton = ellipsoide(C, 'TJ_bouton_%d' % i, P(off + fd + 2.5, hh), C.px(0.7), C.px(1.2), C.px(1.2),
                             seg=12, anneaux_=6)
         lie(C, habille(bouton, M['dore']), ['torse'], rigide=True, lisse=1)
 
     # ---------------- le pantalon, la ceinture
-    bassin = anneaux('TJ_bassin', [(P(0.2, H(-0.24)), L, -F, u * 8.4, u * 7.2),
-                                   (P(0.2, H(-0.08)), L, -F, u * 12.0, u * 8.6),
-                                   (P(0.5, H(0.12)), L, -F, u * 12.4, u * 8.8),
-                                   (P(0.7, H(0.26)), L, -F, u * 11.6, u * 8.3)], n=20, fermer_fin=False)
+    bassin = anneaux('TJ_bassin', [(P(0.2, H(-0.24)), L, -F, u * 8.9, u * 8.2),
+                                   (P(0.3, H(-0.08)), L, -F, u * 12.6, u * 10.0),
+                                   (P(0.7, H(0.12)), L, -F, u * 13.0, u * 10.4),
+                                   (P(1.1, H(0.26)), L, -F, u * 12.3, u * 9.9)], n=20, fermer_fin=False)
     lie(C, habille(bassin, M['pantalon']), ['torse'], rigide=True)
     ceinture = anneaux('TJ_ceinture', [
-        (P(0.5 + 9.2 * math.cos(t), H(0.07)) + L * C.px(12.6 * math.sin(t)),
+        (P(0.6 + 10.7 * math.cos(t), H(0.07)) + L * C.px(13.2 * math.sin(t)),
          (F * -math.sin(t) + L * math.cos(t)).normalized().cross(U), U, u * 0.9, u * 1.4)
         for t in (2 * math.pi * k / 24 for k in range(24))], n=8, boucle=True)
     lie(C, habille(ceinture, M['ceinture']), ['torse'], rigide=True, lisse=1)
     boucle = anneaux('TJ_boucle', [
-        (P(0.5 + 9.2 + 1.1, H(0.07)) + (U * math.cos(t) * 1.9 + L * math.sin(t) * 2.3) * u,
+        (P(0.6 + 10.7 + 1.1, H(0.07)) + (U * math.cos(t) * 2.1 + L * math.sin(t) * 2.5) * u,
          F.cross(U * -math.sin(t) + L * math.cos(t)).normalized(), F, u * 0.45, u * 0.45)
         for t in (2 * math.pi * k / 16 for k in range(16))], n=6, boucle=True)
     lie(C, habille(boucle, M['dore']), ['torse'], rigide=True, lisse=1)
@@ -555,7 +575,7 @@ def recette_tijean(C):
         _, poignet = C.os['avantbras.' + cote]
         pts = [e.lerp(c_, t) for t in (0.0, 0.3, 0.65, 1.0)] + \
               [c_.lerp(poignet, t) for t in (0.3, 0.65, 1.0)]
-        k = C.rig['limbW'] / 5.6
+        k = C.rig['limbW'] / 5.6 * 1.15
         ray = [(5.2 * k, 5.0 * k), (5.0 * k, 5.1 * k), (4.5 * k, 4.6 * k), (3.8 * k, 3.9 * k),
                (4.4 * k, 4.2 * k), (3.9 * k, 3.6 * k), (3.2 * k, 2.9 * k)]
         bras = tube(C, 'TJ_bras.' + cote, pts, ray, n=12)
@@ -570,13 +590,13 @@ def recette_tijean(C):
         cote_ax = C.L if cote == 'L' else -C.L
         pouce_ax = (d.cross(cote_ax)).normalized()
         centre = a + d * C.px(3.2)
-        poing = ellipsoide(C, 'TJ_poing.' + cote, centre, C.px(4.4), C.px(3.8), C.px(3.4),
+        poing = ellipsoide(C, 'TJ_poing.' + cote, centre, C.px(5.0), C.px(4.4), C.px(3.9),
                            axes=(d, pouce_ax, cote_ax), seg=16, anneaux_=10)
         pieces = [poing]
         for j in range(4):
-            off = (j - 1.5) * 1.75
-            pj = centre + d * C.px(2.6) - pouce_ax * C.px(1.8) + cote_ax * C.px(off)
-            pieces.append(ellipsoide(C, 'TJ_phalange.' + cote, pj, C.px(1.5), C.px(1.5), C.px(1.0),
+            off = (j - 1.5) * 2.0
+            pj = centre + d * C.px(3.0) - pouce_ax * C.px(2.1) + cote_ax * C.px(off)
+            pieces.append(ellipsoide(C, 'TJ_phalange.' + cote, pj, C.px(1.7), C.px(1.7), C.px(1.15),
                                      axes=(d, pouce_ax, cote_ax), seg=10, anneaux_=6))
         pieces.append(tube(C, 'TJ_pouce.' + cote, [centre + pouce_ax * C.px(2.4) - d * C.px(0.5),
                                                     centre + pouce_ax * C.px(3.4) + d * C.px(1.8),
@@ -590,7 +610,7 @@ def recette_tijean(C):
         hj, genou = C.os['cuisse.' + cote]
         _, cheville = C.os['tibia.' + cote]
         pts = [hj.lerp(genou, t) for t in (0.0, 0.4, 0.8, 1.0)] + [genou.lerp(cheville, t) for t in (0.3, 0.7, 1.0)]
-        k = C.rig['limbW'] / 5.6
+        k = C.rig['limbW'] / 5.6 * 1.12
         jambe = tube(C, 'TJ_jambe.' + cote, pts,
                      [(5.8 * k, 5.6 * k), (5.4 * k, 5.4 * k), (4.4 * k, 4.4 * k), (4.0 * k, 4.0 * k),
                       (4.4 * k, 4.6 * k), (3.4 * k, 3.4 * k), (2.8 * k, 2.8 * k)], n=12)
@@ -659,11 +679,11 @@ def recette_tijean(C):
     sabre.append(habille(ellipsoide(C, 'TJ_sabre_pommeau', centre - lame_dir * C.px(5.6), C.px(1.7), C.px(1.7),
                                     C.px(1.7), seg=12, anneaux_=6), M['dore']))
     garde = centre + lame_dir * C.px(3.8)
-    sabre.append(habille(tube(C, 'TJ_sabre_garde', [garde - plat * C.px(5.0), garde, garde + plat * C.px(5.0)],
-                              [(1.0, 0.9), (1.4, 1.3), (1.0, 0.9)], n=10, axe_ref=lame_dir), M['dore']))
-    pts = [garde + lame_dir * C.px(d_) + plat * C.px(0.9 * (d_ / 44.0) ** 2 * 3) for d_ in (0.5, 12, 26, 38, 44)]
+    sabre.append(habille(tube(C, 'TJ_sabre_garde', [garde - plat * C.px(6.2), garde, garde + plat * C.px(6.2)],
+                              [(1.3, 1.1), (1.8, 1.6), (1.3, 1.1)], n=10, axe_ref=lame_dir), M['dore']))
+    pts = [garde + lame_dir * C.px(d_) + plat * C.px(0.9 * (d_ / 50.0) ** 2 * 3.5) for d_ in (0.5, 14, 30, 43, 50)]
     sabre.append(habille(tube(C, 'TJ_sabre_lame', pts,
-                              [(0.6, 3.0), (0.55, 2.9), (0.5, 2.7), (0.45, 2.2), (0.1, 0.3)], n=6,
+                              [(0.8, 4.3), (0.75, 4.2), (0.7, 3.9), (0.6, 3.1), (0.1, 0.4)], n=6,
                               axe_ref=C.L), M['lame']))
     for ob in sabre:
         lie(C, ob, ['main.R'], rigide=True, lisse=1)

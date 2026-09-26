@@ -138,7 +138,7 @@ OPTIONS
                       profondeur, tourné de --lacet degrés vers la caméra.
                       C'est la vue des modèles de sp_modele.py. Le choix est
                       enregistré dans le .blend et relu au rendu.
-  --lacet DEGRÉS      rotation du corps vers la caméra en vue trois-quarts (50)
+  --lacet DEGRÉS      rotation du corps vers la caméra en vue trois-quarts (30)
   --max-images N      ne rend que les N premières images de chaque animation
                       (pour un essai rapide)
   --ouvrir FICHIER    ouvre ce .blend avant de travailler ; utile quand on
@@ -286,7 +286,11 @@ def vers_blender(pt, profondeur, unite):
 #    accessoires.
 # ---------------------------------------------------------------------------
 
-LACET_DEFAUT = 50.0          # degrés : le corps tourné vers la caméra (90 = de face)
+# degrés : le corps tourné vers la caméra (90 = de face). 30 : presque de
+# profil, comme les combattants de Smash en jeu — foulées, fentes et coups se
+# lisent de côté. Au-delà de 45, les mouvements partent vers le spectateur et
+# ne se voient plus (mesuré sur les rendus de la course et du smash).
+LACET_DEFAUT = 30.0
 
 # Le squelette du jeu place la cheville un peu SOUS le sol (le pied vectoriel
 # le cache). Un pied 3D, lui, s'y enfoncerait : en vue trois-quarts, la chaîne
