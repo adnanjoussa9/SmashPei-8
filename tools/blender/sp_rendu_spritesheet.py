@@ -131,6 +131,14 @@ OPTIONS
                       contraste moyen-fort, ombres douces, occlusion. Voir la
                       section 4 du script pour les réglages.
   --contre-jour K     multiplie la force du contre-jour (1.0)
+  --vue plan|trois-quarts
+                      (mode squelette) plan : le squelette plat du jeu, pour
+                      des rendus qui collent au dessin vectoriel ;
+                      trois-quarts : un vrai corps 3D, épaules et hanches en
+                      profondeur, tourné de --lacet degrés vers la caméra.
+                      C'est la vue des modèles de sp_modele.py. Le choix est
+                      enregistré dans le .blend et relu au rendu.
+  --lacet DEGRÉS      rotation du corps vers la caméra en vue trois-quarts (50)
   --max-images N      ne rend que les N premières images de chaque animation
                       (pour un essai rapide)
   --ouvrir FICHIER    ouvre ce .blend avant de travailler ; utile quand on
@@ -257,6 +265,111 @@ def vers_blender(pt, profondeur, unite):
     return (pt[0] * unite, profondeur * unite, -pt[1] * unite)
 
 
+# ---------------------------------------------------------------------------
+# 1 bis) LA VUE TROIS-QUARTS — pour un vrai modèle 3D
+#
+#    Le squelette du jeu est un pantin PLAT : les deux épaules sont écartées
+#    dans le plan de l'écran (le « trois-quarts » est dessiné). Posé sur un
+#    corps 3D, ce squelette ferait marcher le personnage en pas chassés : ses
+#    jambes s'écarteraient sur le côté au lieu d'avancer.
+#
+#    En vue trois-quarts, on garde EXACTEMENT les angles du jeu, mais on les
+#    applique dans le plan du corps (avant / haut), et on écarte épaules et
+#    hanches en PROFONDEUR, comme sur un vrai corps. Puis on tourne le corps de
+#    `lacet` degrés vers la caméra : c'est la pose de présentation des
+#    personnages de Smash Bros, qui montre le torse et le visage tout en
+#    regardant vers l'avant.
+#
+#    Le squelette 3D ne tombe plus exactement sur le dessin vectoriel : le
+#    rendu enregistre donc, image par image, où sont vraiment la tête, la
+#    poitrine et le bassin (les « ancres »), et c'est là que le jeu pose les
+#    accessoires.
+# ---------------------------------------------------------------------------
+
+LACET_DEFAUT = 50.0          # degrés : le corps tourné vers la caméra (90 = de face)
+
+# Le squelette du jeu place la cheville un peu SOUS le sol (le pied vectoriel
+# le cache). Un pied 3D, lui, s'y enfoncerait : en vue trois-quarts, la chaîne
+# de la jambe est raccourcie d'autant, ce qui pose la chaussure sur le sol —
+# et donne au passage les jambes courtes des proportions « Smash ».
+JAMBES_34 = 0.88
+
+
+def repere_corps(vue, lacet):
+    """Les axes du corps dans Blender : F avant, U haut, L côté (vers le fond)."""
+    if vue != 'trois-quarts':
+        return (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)
+    a = math.radians(lacet)
+    return (math.cos(a), -math.sin(a), 0.0), (0.0, 0.0, 1.0), (math.sin(a), math.cos(a), 0.0)
+
+
+def os_du_squelette_34(pose, rig):
+    """Comme os_du_squelette, mais épaules et hanches écartées en profondeur :
+    (nom, parent, tête (x, y), queue (x, y), côté) ; `côté` est l'écart
+    latéral, positif vers le fond (membres L), négatif vers la caméra (R)."""
+    g = lambda k, d=0.0: float(pose.get(k, d))
+    torso, lean = g('torso'), g('lean')
+    r, lw = rig['headR'], rig['limbW']
+    hip = (0.0, -rig['legLen'] * 0.92 + g('hipY'))
+    chest = fk_point(*hip, torso + lean * 0.4, rig['torsoLen'])
+    epaule = fk_point(*chest, 180 + torso, rig['torsoLen'] * 0.1)
+    l_ep, l_ha = rig['shoulderW'] * 0.82, rig['hipW'] * 1.05
+
+    def bras(sh, se):
+        el = fk_point(*epaule, 180 + torso + sh, rig['upArm'])
+        ha = fk_point(*el, 180 + torso + sh + se, rig['foreArm'])
+        bout = fk_point(*ha, 180 + torso + sh + se, lw * 1.2)
+        return el, ha, bout
+
+    def jambe(hp, kn):
+        k = fk_point(*hip, 180 + hp, rig['thigh'] * JAMBES_34)
+        ft = fk_point(*k, 180 + hp + kn, rig['shin'] * JAMBES_34)
+        bout = fk_point(*ft, 90 + hp + kn, lw * 2.0)
+        return k, ft, bout
+
+    el_l, ha_l, mn_l = bras(g('shL', 8), g('elL', 10))
+    el_r, ha_r, mn_r = bras(g('shR', -8), g('elR', 10))
+    kn_l, ft_l, pd_l = jambe(g('hpL', 6), g('knL', 6))
+    kn_r, ft_r, pd_r = jambe(g('hpR', -6), g('knR', 6))
+    head_brut = fk_point(*chest, torso + g('head') * 0.35, rig['neck'] + r * 0.72)
+    head = (head_brut[0] + g('headX'), head_brut[1] + g('headY'))
+    neck = fk_point(*chest, torso, rig['neck'] * 0.25)
+    rot = g('head') * 0.5 + torso * 0.3
+    return [
+        ('racine', None, (0.0, 0.0), (0.0, -r), 0.0),
+        ('torse', 'racine', hip, chest, 0.0),
+        ('cou', 'torse', neck, (neck[0] * 0.3 + head[0] * 0.7, neck[1] * 0.3 + head[1] * 0.7), 0.0),
+        ('tete', 'cou', head, fk_point(*head, rot, r), 0.0),
+        ('bras.L', 'torse', epaule, el_l, l_ep),
+        ('avantbras.L', 'bras.L', el_l, ha_l, l_ep),
+        ('main.L', 'avantbras.L', ha_l, mn_l, l_ep),
+        ('bras.R', 'torse', epaule, el_r, -l_ep),
+        ('avantbras.R', 'bras.R', el_r, ha_r, -l_ep),
+        ('main.R', 'avantbras.R', ha_r, mn_r, -l_ep),
+        ('cuisse.L', 'racine', hip, kn_l, l_ha),
+        ('tibia.L', 'cuisse.L', kn_l, ft_l, l_ha),
+        ('pied.L', 'tibia.L', ft_l, pd_l, l_ha),
+        ('cuisse.R', 'racine', hip, kn_r, -l_ha),
+        ('tibia.R', 'cuisse.R', kn_r, ft_r, -l_ha),
+        ('pied.R', 'tibia.R', ft_r, pd_r, -l_ha),
+    ]
+
+
+def corps_vers_monde(pt, cote, repere, unite):
+    """(x avant, y bas) du jeu + écart latéral -> coordonnées Blender, en mètres."""
+    F, U, L = repere
+    x, h, l = pt[0], -pt[1], cote
+    return tuple((x * F[i] + h * U[i] + l * L[i]) * unite for i in range(3))
+
+
+def os_monde(pose, rig, vue='plan', lacet=LACET_DEFAUT, unite=0.01):
+    """Chaque os, en coordonnées Blender : (nom, parent, tête, queue)."""
+    rep = repere_corps(vue, lacet)
+    liste = os_du_squelette_34(pose, rig) if vue == 'trois-quarts' else os_du_squelette(pose, rig)
+    return [(n, p, corps_vers_monde(t, c, rep, unite), corps_vers_monde(q, c, rep, unite))
+            for n, p, t, q, c in liste]
+
+
 def cadre_camera(rig, marge):
     """Hauteur visible par la caméra (en pixels de jeu) et hauteur de son centre."""
     hauteur = rig['legLen'] + rig['torsoLen'] + rig['neck'] + rig['headR'] * 2.4
@@ -269,7 +382,8 @@ def lit_arguments(argv):
     o = {'poses': None, 'mode': 'rendu', 'sortie': None, 'unite': 0.01, 'taille': 384,
          'marge': 2.2, 'anims': None, 'mannequin': False, 'sans_tete': False,
          'tete': 'vectorielle', 'contour': False, 'style': 'classique',
-         'ouvrir': None, 'max_images': 0}
+         'ouvrir': None, 'max_images': 0, 'vue': 'plan', 'lacet': LACET_DEFAUT,
+         'contre_jour': 1.0}
     i = 0
     while i < len(args):
         a = args[i]
@@ -278,7 +392,7 @@ def lit_arguments(argv):
         elif a.startswith('--') and i + 1 < len(args):
             cle = a[2:].replace('-', '_')
             val = args[i + 1]
-            if cle in ('unite', 'marge', 'contre_jour'):
+            if cle in ('unite', 'marge', 'contre_jour', 'lacet'):
                 val = float(val)
             elif cle in ('taille', 'max_images'):
                 val = int(val)
@@ -301,13 +415,13 @@ def lit_arguments(argv):
 AXE_CAMERA = (0.0, -1.0, 0.0)      # l'axe Z des os regarde la caméra
 
 
-def matrice_os(tete, queue):
+def matrice_os(tete, queue, axe_z=AXE_CAMERA):
     """Matrice d'os (espace armature) : Y le long de l'os, Z vers la caméra."""
     y = Vector(queue) - Vector(tete)
     if y.length < 1e-9:
         y = Vector((0.0, 0.0, 1.0))
     y.normalize()
-    z = Vector(AXE_CAMERA)
+    z = Vector(axe_z)
     z = (z - y * z.dot(y)).normalized()
     x = y.cross(z)
     m = Matrix((
@@ -319,7 +433,26 @@ def matrice_os(tete, queue):
     return m
 
 
+def axe_roulis(vue, lacet):
+    """L'axe Z des os : vers la caméra, perpendiculaire au plan du corps."""
+    L = repere_corps(vue, lacet)[2]
+    return (-L[0], -L[1], -L[2])
+
+
 def cree_squelette(doc, o):
+    obj = cree_armature(doc, o)
+    unite = o['unite']
+    bibliotheque_materiaux(doc, unite)
+    if o['mannequin']:
+        cree_mannequin(obj, doc, unite)
+
+    chemin = os.path.join(o['sortie'], doc['perso'] + '_squelette.blend')
+    bpy.ops.wm.save_as_mainfile(filepath=chemin)
+    print('Smash Péi : squelette enregistré ->', chemin)
+
+
+def cree_armature(doc, o):
+    """Une scène vide et l'armature SP_Rig, en pose de repos (idle, image 0)."""
     rig, unite = doc['rig'], o['unite']
     repos = doc['animations']['idle']['poses'][0] if 'idle' in doc['animations'] else {}
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -328,27 +461,23 @@ def cree_squelette(doc, o):
     bpy.context.scene.collection.objects.link(obj)
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.mode_set(mode='EDIT')
-    for nom, parent, t, q, dz in os_du_squelette(repos, rig):
+    axe_z = axe_roulis(o['vue'], o['lacet'])
+    for nom, parent, t, q in os_monde(repos, rig, o['vue'], o['lacet'], unite):
         eb = arm.edit_bones.new(nom)
-        eb.head = vers_blender(t, dz, unite)
-        eb.tail = vers_blender(q, dz, unite)
+        eb.head = t
+        eb.tail = q
         if (eb.tail - eb.head).length < 1e-6:
             eb.tail = eb.head + Vector((0, 0, 0.01))
-        eb.align_roll(Vector(AXE_CAMERA))
+        eb.align_roll(Vector(axe_z))
         eb.use_connect = False
         if parent:
             eb.parent = arm.edit_bones[parent]
     bpy.ops.object.mode_set(mode='OBJECT')
     obj['smashpei_perso'] = doc['perso']
     obj['smashpei_unite'] = unite
-
-    bibliotheque_materiaux(doc, unite)
-    if o['mannequin']:
-        cree_mannequin(obj, doc, unite)
-
-    chemin = os.path.join(o['sortie'], doc['perso'] + '_squelette.blend')
-    bpy.ops.wm.save_as_mainfile(filepath=chemin)
-    print('Smash Péi : squelette enregistré ->', chemin)
+    obj['smashpei_vue'] = o['vue']
+    obj['smashpei_lacet'] = float(o['lacet'])
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -521,14 +650,20 @@ def cree_mannequin(arm_obj, doc, unite):
         attache(rot, pb.name, mat)
 
 
+def vue_de(arm_obj):
+    """La vue et le lacet avec lesquels ce squelette a été construit."""
+    return arm_obj.get('smashpei_vue', 'plan'), float(arm_obj.get('smashpei_lacet', LACET_DEFAUT))
+
+
 def pose_armature(arm_obj, pose, rig, unite):
     """Place chaque os à sa position et à son orientation exactes (espace armature)."""
-    liste = os_du_squelette(pose, rig)
-    for nom, parent, t, q, dz in liste:            # parents d'abord : l'ordre de la liste
+    vue, lacet = vue_de(arm_obj)
+    axe_z = axe_roulis(vue, lacet)
+    for nom, parent, t, q in os_monde(pose, rig, vue, lacet, unite):   # parents d'abord
         pb = arm_obj.pose.bones.get(nom)
         if pb is None:
             continue
-        pb.matrix = matrice_os(vers_blender(t, dz, unite), vers_blender(q, dz, unite))
+        pb.matrix = matrice_os(t, q, axe_z)
         bpy.context.view_layer.update()
     # clés de forme
     for ob in bpy.data.objects:
@@ -572,7 +707,10 @@ STYLE_ULTIMATE = {
         ('SP_ContreJour',  (0.95, 0.97, 1.00), 25.0, (-85.0, 0.0, 40.0), 2.0),   # dos, liseré côté visage
         ('SP_ContreJour2', (1.00, 0.93, 0.85), 18.0, (-85.0, 0.0, -40.0), 2.0),  # dos, liseré côté nuque
     ],
-    'monde': ((0.20, 0.22, 0.26), 0.2),      # couleur, force : l'ambiance des ombres
+    # l'ambiance : assez claire pour que les métaux aient quelque chose à
+    # refléter (une lame dans un monde noir paraît noire), assez faible pour
+    # ne pas aplatir le modelé
+    'monde': ((0.42, 0.46, 0.52), 0.32),
     'rendu': ('AgX', ('AgX - Medium High Contrast', 'Medium High Contrast')),
     'echantillons': 64,
 }
@@ -711,10 +849,19 @@ def rend(doc, o):
             scene.render.filepath = os.path.join(sous, fichier)
             bpy.ops.render.render(write_still=True)
             # l'origine du jeu (les pieds) projetée dans l'image
-            u = world_to_camera_view(scene, scene.camera, Vector((0.0, 0.0, 0.0)))
+            def px(p):
+                u = world_to_camera_view(scene, scene.camera, Vector(p))
+                return [round(u.x * o['taille'], 2), round((1.0 - u.y) * o['taille'], 2)]
+            mw = arm_obj.matrix_world
+            os_ = arm_obj.pose.bones
+            ancres = {}
+            if 'tete' in os_ and 'torse' in os_:
+                ancres = {'tete': px(mw @ os_['tete'].head), 'poitrine': px(mw @ os_['torse'].tail),
+                          'bassin': px(mw @ os_['torse'].head)}
             images.append({
                 'fichier': 'images/%s/%s' % (nom, fichier),
-                'origine': [u.x * o['taille'], (1.0 - u.y) * o['taille']],
+                'origine': px((0.0, 0.0, 0.0)),
+                'ancres': ancres,
                 'pose': pose
             })
             print('Smash Péi :', nom, i + 1, '/', len(poses))

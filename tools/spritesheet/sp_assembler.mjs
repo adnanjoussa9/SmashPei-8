@@ -56,6 +56,9 @@
              { "x":0, "y":0, "w":80, "h":190,   rectangle dans la planche
                "ox":40, "oy":186,               position des PIEDS dans ce
                                                 rectangle (origine du jeu)
+               "ancres": { hx, hy, cx, cy,      tête, poitrine, bassin, en
+                           hipX, hipY },        pixels de jeu depuis les pieds
+                                                (quand Blender les a mesurées)
                "pose": { ... } }                la pose qui a produit l'image
            ] }
          }
@@ -264,11 +267,22 @@ export function assemble(o) {
   for (const [nom, anim] of Object.entries(man.animations)) animations[nom] = { boucle: !!anim.boucle, frames: [] };
   for (const b of boites) {
     const [ox, oy] = b.im.origine;
-    animations[b.nom].frames.push({
+    const fr = {
       x: b.px0, y: b.py0, w: b.w, h: b.h,
       ox: +(ox - b.x0).toFixed(2), oy: +(oy - b.y0).toFixed(2),
       pose: b.im.pose, _i: b.im.fichier
-    });
+    };
+    /* Les ancres mesurées par Blender (tête, poitrine, bassin), ramenées
+       en pixels de JEU, relatives aux pieds : le jeu y pose les
+       accessoires du vestiaire. Indispensables en vue trois-quarts, où le
+       squelette 3D ne tombe plus exactement sur le dessin vectoriel. */
+    const A = b.im.ancres;
+    if (A && A.tete && A.poitrine && A.bassin) {
+      const e = man.echelle || 1, jeu = p => [+((p[0] - ox) / e).toFixed(2), +((p[1] - oy) / e).toFixed(2)];
+      const [hx, hy] = jeu(A.tete), [cx, cy] = jeu(A.poitrine), [bx, by] = jeu(A.bassin);
+      fr.ancres = { hx, hy, cx, cy, hipX: bx, hipY: by };
+    }
+    animations[b.nom].frames.push(fr);
   }
   /* on remet les images dans l'ordre de l'animation */
   for (const a of Object.values(animations)) {

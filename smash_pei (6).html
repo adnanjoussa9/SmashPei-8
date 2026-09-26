@@ -57545,13 +57545,20 @@ html.tact .topbar{ display:none !important; }
     const f = ch.features || {};
     const Pal = ch.pal || {};
     const An = ancres(R, fr.pose || REST);
+    /* Les ancres MESURÉES par Blender priment : en vue trois-quarts, le
+       corps 3D ne tombe pas exactement sur le squelette plat du jeu. */
+    const M3 = fr.ancres;
+    if (M3) {
+      An.hx = An.hxBrut = M3.hx; An.hy = An.hyBrut = M3.hy;
+      An.cx = M3.cx; An.cy = M3.cy; An.hipX = M3.hipX; An.hipY = M3.hipY;
+    }
 
     ctx.save();
     ctx.scale(S, S);
     /* les mêmes transformations que le squelette vectoriel */
     ctx.translate(pose.hipX || 0, 0);
     ctx.scale(pose.sx || 1, pose.sy || 1);
-    const hipY = -R.legLen * 0.92 + (fr.pose ? fr.pose.hipY || 0 : 0);
+    const hipY = M3 ? M3.hipY : -R.legLen * 0.92 + (fr.pose ? fr.pose.hipY || 0 : 0);
     ctx.save();
     ctx.translate(0, hipY);
     ctx.rotate(rad(pose.hipRot || 0));
