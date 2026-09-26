@@ -56480,6 +56480,1474 @@ html.tact .topbar{ display:none !important; }
   else setTimeout(lancer, 0);
 })();
 
+
+/* ===== 102-hitlag.js ===== */
+/* ============================================================
+   SMASH PÉI — LE MÊME GEL POUR LES DEUX
+
+   Le joueur demande le « freeze-frame » de Smash : un arrêt très
+   court au moment où le coup touche, proportionnel à sa puissance,
+   pour l'attaquant ET pour la victime.
+
+   Le jeu en avait déjà un (`hitlag`, `Match.impact`). Il ne manquait
+   pas le gel : c'est sa règle qui était fausse. Mesure faite sur un
+   vrai match, Ti Jean frappant le Volkan, coups réels du moteur :
+
+       coup              dégâts   gel victime   gel attaquant
+       jab                 3,8          2              2
+       tilt avant          6,9          3              2
+       aérien avant       16           10              8
+       aérien bas         15,1         15             12
+       smash avant        25,2         26             14
+       smash chargé       35,3         35             14
+       projectile à 600 px  7,7         6              5
+
+   Trois défauts s'y lisent :
+
+     1. LES DEUX CORPS NE SONT PAS GELÉS LE MÊME TEMPS. La victime
+        suit une formule, l'attaquant une autre, plafonnée à 14. Sur
+        un smash chargé, l'attaquant se remet à bouger VINGT ET UNE
+        images avant que sa cible reparte : il a le temps de se
+        replacer, voire de recommencer, sur une cible encore figée.
+        Dans Smash, les deux gels sont identiques : c'est ce qui fait
+        que les deux corps « se heurtent ».
+
+     2. LE GEL DE LA VICTIME N'A PAS DE PLAFOND : 35 images, plus
+        d'une demi-seconde d'arrêt, sur un smash chargé. Le joueur a
+        le temps de croire que le jeu a sauté.
+
+     3. LE RÉGLAGE « TEMPS D'ARRÊT » DU JOUEUR NE S'APPLIQUE QU'À
+        L'ATTAQUANT. À 50 %, la victime reste figée 26 images sur un
+        smash quand son agresseur n'en fait plus que 11.
+
+   Et un quatrième, plus discret : un projectile qui touche à l'autre
+   bout de l'arène fige celui qui l'a lancé. Dans Smash, le tireur
+   n'est jamais gelé par un coup qui l'a quitté.
+
+   LA CORRECTION
+   Une seule formule, dans la table `HITLAG` ci-dessous, appliquée
+   aux deux combattants :
+
+       gel = (BASE + dégâts × PAR_DEGAT) × multiplicateur du coup
+             × réglage du joueur,   borné à PLAFOND
+
+   C'est la forme de celle de Smash Ultimate (6 + 0,65 × dégâts),
+   recalibrée parce que les dégâts de Smash Péi sont environ deux
+   fois plus élevés que ceux de Smash. Le multiplicateur propre à
+   chaque coup (`h.hitlag`, déjà réglé coup par coup et par les
+   signatures du module 47) est respecté mais adouci, pour qu'un
+   ×1,7 de signature ne suffise pas à toucher le plafond.
+
+   Ce qui NE change PAS :
+     · le gel global (`Match.hitstop`) des K.O., supers, parades et
+       boucliers brisés ;
+     · le gel sur bouclier, la parade parfaite (26 images punitives,
+       voulues), les armures et le super en cours ;
+     · la boucle à pas fixe : on ne fait que régler un compteur que
+       `Fighter.update` décompte déjà, image par image ;
+     · les replays, qui enregistrent des positions et non des
+       entrées, et le jeu en ligne, où l'hôte calcule ce compteur et
+       le transmet déjà (champ 20 de l'instantané).
+   ============================================================ */
+(function hitlagCommun() {
+  if (typeof Fighter === 'undefined' || !Fighter.prototype || !Fighter.prototype.takeHit) return;
+  if (typeof ST === 'undefined') return;
+  if (Fighter.prototype.takeHit.__hitlag102) return;
+
+  /* ------------------------------------------------------------
+     LA TABLE — tout le réglage est ici.
+     Valeurs obtenues avec le même banc que la mesure ci-dessus :
+
+       coup              dégâts   gel (attaquant = victime)
+       jab                 3,8        4
+       tilt avant          6,9        5
+       aérien avant       16          9
+       aérien bas         15,1       11
+       smash avant        25,2       16
+       smash chargé       35,3       20 (plafond)
+       lancer avant       12          8
+       projectile          7,7        6, tireur non gelé
+
+     Le réglage « temps d'arrêt » du joueur s'applique désormais aux
+     deux : à 50 %, le smash avant fige chacun 8 images ; à 0 %, plus
+     aucun gel.
+     ------------------------------------------------------------ */
+  const HITLAG = {
+    BASE: 4,            // images de gel d'un coup sans dégâts
+    PAR_DEGAT: 0.30,    // images ajoutées par point de dégât
+    PLANCHER: 1,        // un coup qui touche se sent toujours
+    PLAFOND: 20,        // un tiers de seconde, jamais plus
+    /* le multiplicateur du coup est ramené vers 1 : 1,7 → 1,42 */
+    DOUCEUR_MUL: 0.6,
+    /* un coup électrique fige plus longtemps, comme dans Smash */
+    MUL_FX: { shock: 1.5 },
+    /* au-delà de cette distance entre les deux corps, l'attaquant
+       n'a pas porté le coup lui-même (projectile, invocation) : il
+       n'est pas gelé */
+    CONTACT: 170
+  };
+  window.HITLAG = HITLAG;
+
+  function reglageJoueur() {
+    const v = (typeof Save !== 'undefined' && Save.data && Save.data.opts) ? Save.data.opts.hitstop : 1;
+    return (typeof v === 'number' && isFinite(v)) ? v : 1;
+  }
+
+  /* La durée du gel, pour des dégâts RÉELLEMENT infligés (après
+     tous les multiplicateurs du moteur : règles, objets, solo…). */
+  function dureeGel(dmg, h) {
+    const brut = (h && typeof h.hitlag === 'number') ? h.hitlag : 1;
+    const mul = 1 + (brut - 1) * HITLAG.DOUCEUR_MUL;
+    const fx = (h && HITLAG.MUL_FX[h.fx]) || 1;
+    const opt = reglageJoueur();
+    if (opt <= 0) return 0;                       // le joueur a coupé le gel
+    const v = Math.round((HITLAG.BASE + dmg * HITLAG.PAR_DEGAT) * mul * fx * opt);
+    return clamp(v, HITLAG.PLANCHER, HITLAG.PLAFOND);
+  }
+  HITLAG.duree = dureeGel;
+
+  /* Le coup vient-il du corps de l'attaquant ? Un coup de la boucle
+     de collisions porte sa boîte (`h.box`) : c'est un coup au
+     contact. Les autres (projectiles, prises de commande, lancers,
+     glissades) sont jugés à la distance. */
+  function auContact(src, cible, h) {
+    if (!src || src === cible || typeof src.hitlag !== 'number' || !src.takeHit) return false;
+    if (h && h.box) return true;
+    const dx = (src.cx !== undefined ? src.cx : src.x) - (cible.cx !== undefined ? cible.cx : cible.x);
+    const dy = (src.cy !== undefined ? src.cy : src.y) - (cible.cy !== undefined ? cible.cy : cible.y);
+    return dx * dx + dy * dy <= HITLAG.CONTACT * HITLAG.CONTACT;
+  }
+
+  const orig = Fighter.prototype.takeHit;
+  const env = function (src, h, dir, hitPos) {
+    /* On ne corrige QUE l'éjection. Pour la reconnaître sans deviner,
+       on écoute le passage en HITSTUN ou TUMBLE pendant l'appel :
+       c'est le seul chemin de `takeHit` qui l'emprunte. Bouclier,
+       parade, armure, contre et super gardent leur propre gel. */
+    let lance = false;
+    const propre = Object.prototype.hasOwnProperty.call(this, 'setState');
+    const ssAvant = this.setState;
+    this.setState = function (s) {
+      if (s === ST.HITSTUN || s === ST.TUMBLE) lance = true;
+      return ssAvant.apply(this, arguments);
+    };
+
+    const dmgAvant = this.dmgTaken;
+    const hlSrcAvant = (src && typeof src.hitlag === 'number') ? src.hitlag : 0;
+    let r;
+    try { r = orig.call(this, src, h, dir, hitPos); }
+    finally {
+      if (propre) this.setState = ssAvant; else delete this.setState;
+    }
+
+    try {
+      if (r && lance && this.alive !== false && this.state !== ST.DEAD) {
+        const dmg = Math.max(0, this.dmgTaken - dmgAvant);
+        const gel = dureeGel(dmg, h);
+        this.hitlag = gel;
+        if (src && typeof src.hitlag === 'number' && src !== this) {
+          /* L'attaquant : le même gel s'il a frappé au contact. Sinon
+             on lui rend exactement ce qu'il avait avant l'appel — le
+             moteur l'avait gelé pour un projectile parti de loin. On
+             garde le plus long des deux quand il vient de toucher
+             plusieurs cibles dans la même image. */
+          src.hitlag = auContact(src, this, h) ? Math.max(hlSrcAvant, gel) : hlSrcAvant;
+        }
+      }
+    } catch (e) {
+      if (!hitlagCommun.__vu) { hitlagCommun.__vu = 1; try { console.error('[hitlag]', e); } catch (e2) {} }
+    }
+    return r;
+  };
+  env.__hitlag102 = 1;
+  /* les marques des enveloppes précédentes restent lisibles */
+  if (orig.__lis) env.__lis = orig.__lis;
+  Fighter.prototype.takeHit = env;
+})();
+
+
+/* ===== 103-di.js ===== */
+/* ============================================================
+   SMASH PÉI — LE DI SE JOUE PENDANT LE GEL
+
+   Le joueur demande le DI de Smash : pouvoir infléchir un peu sa
+   trajectoire d'éjection en tenant une direction, sans en prendre
+   le contrôle.
+
+   Le moteur en avait une ébauche, dans `takeHit` :
+
+       ang += stick_horizontal × 15°
+
+   Mesure faite avec une manette simulée, Ti Jean frappant le Volkan
+   à 90 %, angle de sortie relevé à la première image de vol :
+
+       situation                          sans DI   avec   écart
+       éjecté à droite, stick →              40°      56°    +16°  plus vertical
+       éjecté à gauche, stick →             139°     156°    +17°  plus HORIZONTAL
+       éjecté à l'horizontale, stick ↑        0°       0°      0°
+       stick ↑ poussé PENDANT le gel          0°       1°      0°
+       bot de niveau 5, 200 éjections         —        —     0,4° en moyenne
+
+   Quatre défauts :
+
+     1. LE STICK EST LU À L'IMAGE DU COUP. Or tout l'intérêt du gel
+        (module 102), c'est de laisser à la victime le temps de
+        réagir. Pire : `readDI()` relevait bien le stick pendant le
+        gel, dans `this.di` et `this.diY`… et personne ne les lisait.
+
+     2. SEUL L'AXE HORIZONTAL COMPTE. Une éjection horizontale —
+        celle qui tue par les côtés — ne peut pas être infléchie du
+        tout, puisque c'est l'axe VERTICAL qui lui est perpendiculaire.
+
+     3. LE MÊME GESTE A DEUX SENS. Tenir « droite » fait tourner la
+        trajectoire toujours dans le même sens de rotation : vers le
+        haut quand on part à droite, vers le sol quand on part à
+        gauche. Impossible à apprendre.
+
+     4. LES BOTS N'EN FONT JAMAIS, même au niveau 5. Un Zarboutan
+        meurt donc plus tôt qu'un humain moyen.
+
+   LA CORRECTION — celle de Smash, bornée :
+
+     · l'effet du moteur est retiré au moment du coup, pour qu'il ne
+       se cumule pas ;
+     · à la FIN du gel, on lit le stick et on ne garde que sa
+       composante PERPENDICULAIRE à la trajectoire. Tenir dans le
+       sens du vol ou à contresens ne fait rien ; tenir de côté
+       infléchit, au plus de DI.MAX degrés ;
+     · la vitesse d'éjection ne change pas : on tourne le vecteur,
+       on ne l'allonge jamais. La distance parcourue reste celle que
+       l'équilibrage a prévue ; seule la direction bouge ;
+     · les bots font un DI de survie (vers le centre de l'arène),
+       d'autant plus juste et d'autant plus fréquent que leur niveau
+       est élevé. Aux petits niveaux ils se trompent de sens : c'est
+       dans la lignée des défauts calibrés du module 57.
+
+   RÉSULTAT, même banc :
+
+       situation                          sans DI   avec   écart
+       éjecté à droite 44°, stick →          40°      27°    −13°  (seule la
+                                                                  part ⊥ compte)
+       éjecté à l'horizontale, stick ↑        0°      18°    +18°
+       éjecté à l'horizontale, stick ↓        0°     −18°    −18°
+       stick ↑ poussé PENDANT le gel          0°      19°    +18°
+       stick dans le sens du vol             40°      41°      0°
+       éjecté à gauche, stick ⊥ (↗)         139°     120°    −18°
+
+       bots, 200 éjections   tente un DI   bon sens   écart moyen
+       niveau 1                  4 %          56 %        0,5°
+       niveau 3                 40 %          86 %        5,3°
+       niveau 5                 93 %          99 %       14,8°
+
+   La norme de la vitesse ne bouge pas (à la gravité d'une image près).
+
+   LA CHUTE (module 75) : elle ne touche jamais un combattant en
+   HITSTUN ou TUMBLE. Le DI n'agit qu'à l'image du départ, pendant
+   ces états-là : les deux ne peuvent pas se croiser. Contrôlé sur
+   trois matchs de quatre bots de niveau 5 (plus de 16 000 images,
+   441 DI joués) : zéro image où la condamnation s'est déclenchée
+   pendant une éjection.
+   ============================================================ */
+(function diDuGel() {
+  if (typeof Fighter === 'undefined' || !Fighter.prototype || !Fighter.prototype.takeHit) return;
+  if (typeof ST === 'undefined') return;
+  if (Fighter.prototype.takeHit.__di103) return;
+
+  const DI = {
+    MAX: 18,            // degrés, au plus : la valeur de Smash Ultimate
+    ZONE_MORTE: 0.22,   // en deçà, un pouce qui repose ne compte pas
+    /* le DI du moteur d'origine, qu'on retire pour ne pas cumuler */
+    ANCIEN: 15,
+    /* les bots : chance de tenter un DI, et chance de se tromper de
+       sens, lues dans la table des niveaux (champs `tech` et `err`) */
+    BOT_TENTE_MUL: 1.1,
+    BOT_FORCE: 0.9
+  };
+  window.DI_REGLAGES = DI;
+
+  const EJECTION = {};
+  EJECTION[ST.HITSTUN] = 1; EJECTION[ST.TUMBLE] = 1;
+
+  /* Tourne le vecteur vitesse de `deg` degrés, dans le repère du
+     moteur (angles comptés vers le haut, y de l'écran vers le bas). */
+  function tourne(f, deg) {
+    if (!deg) return;
+    const v = Math.hypot(f.vx, f.vy);
+    if (!(v > 0)) return;
+    const a = Math.atan2(-f.vy, f.vx) + deg * Math.PI / 180;
+    f.vx = Math.cos(a) * v;
+    f.vy = -Math.sin(a) * v;
+    f.kbAngle = (f.kbAngle || 0) + deg;
+  }
+
+  /* Le DI d'un stick (x vers la droite, y vers le BAS comme la
+     manette) sur la trajectoire actuelle : composante perpendiculaire,
+     positive = rotation vers la gauche du sens de vol. */
+  function ecartStick(f, sx, sy) {
+    const m = Math.hypot(sx, sy);
+    if (m < DI.ZONE_MORTE) return 0;
+    const k = Math.min(1, m) / m;
+    const ux = sx * k, uy = -sy * k;                 // repère « y vers le haut »
+    const a = Math.atan2(-f.vy, f.vx);
+    const perp = -Math.sin(a) * ux + Math.cos(a) * uy; // stick · normale gauche
+    return clamp(perp, -1, 1) * DI.MAX;
+  }
+
+  function niveauBot(f) {
+    const b = f.cpuBrain;
+    if (b && b.lv) return b.lv;
+    if (typeof AI_LEVELS !== 'undefined') return AI_LEVELS[(f.slot && f.slot.level) || 2] || null;
+    return null;
+  }
+
+  /* Le DI d'un bot : tourner la trajectoire vers le centre de l'arène. */
+  function ecartBot(f) {
+    const L = niveauBot(f);
+    const tente = L ? clamp((L.tech || 0) * DI.BOT_TENTE_MUL, 0, 1) : 0;
+    if (Math.random() >= tente) return 0;
+    const B = f.M && f.M.stage && f.M.stage.bounds;
+    if (!B) return 0;
+    const cx = (B.left + B.right) / 2, cy = (B.top + B.bottom) / 2;
+    const tx = cx - f.x, ty = -(cy - f.y);           // repère « y vers le haut »
+    const vx = f.vx, vy = -f.vy;
+    let sens = Math.sign(vx * ty - vy * tx) || 1;    // produit vectoriel
+    if (L && Math.random() < (L.err || 0)) sens = -sens;
+    return sens * DI.MAX * DI.BOT_FORCE * (0.6 + 0.4 * (L ? (L.tech || 0) : 0));
+  }
+
+  function appliqueDI(f) {
+    f.__diAttente = false;
+    if (!EJECTION[f.state] || !f.alive || f.grabber) return;
+    let ecart;
+    if (f.slot && f.slot.kind === 'cpu') ecart = ecartBot(f);
+    else {
+      /* le stick au moment où le gel se termine */
+      let sx = f.di || 0, sy = f.diY || 0;
+      try { const inp = f.readInput(); sx = inp.ax || 0; sy = inp.ay || 0; } catch (e) {}
+      ecart = ecartStick(f, sx, sy);
+    }
+    tourne(f, ecart);
+    f.__diDernier = ecart;
+  }
+
+  /* ------------------------------------------------------------
+     1) AU COUP : on retire le DI du moteur, et on met le vrai en
+        attente de la fin du gel.
+     ------------------------------------------------------------ */
+  const takeOrig = Fighter.prototype.takeHit;
+  const env = function (src, h, dir, hitPos) {
+    /* Le moteur lit le stick à l'intérieur de l'appel : on relit la
+       même valeur, au même instant, pour annuler exactement son effet. */
+    let ancien = 0;
+    try {
+      if (this.slot && this.slot.kind !== 'cpu' && typeof Input !== 'undefined') {
+        const d = Input.devices[this.slot.device];
+        if (d && d.ax) ancien = clamp(d.ax, -1, 1) * DI.ANCIEN;
+      }
+    } catch (e) {}
+
+    const kbAvant = this.kbAngle, vxAvant = this.vx, vyAvant = this.vy;
+    const r = takeOrig.call(this, src, h, dir, hitPos);
+
+    try {
+      const lance = r && EJECTION[this.state] &&
+                    (this.kbAngle !== kbAvant || this.vx !== vxAvant || this.vy !== vyAvant);
+      if (lance) {
+        if (ancien) tourne(this, -ancien);
+        this.__diAttente = true;
+        /* gel coupé par le joueur : pas d'attente, le DI se joue tout de suite */
+        if (!(this.hitlag > 0)) appliqueDI(this);
+      }
+    } catch (e) {
+      if (!diDuGel.__vu) { diDuGel.__vu = 1; try { console.error('[DI]', e); } catch (e2) {} }
+    }
+    return r;
+  };
+  env.__di103 = 1;
+  for (const k of ['__lis', '__hitlag102']) if (takeOrig[k]) env[k] = takeOrig[k];
+  Fighter.prototype.takeHit = env;
+
+  /* ------------------------------------------------------------
+     2) À LA FIN DU GEL : la première image où le combattant
+        n'est plus figé, avant sa physique.
+     ------------------------------------------------------------ */
+  const majOrig = Fighter.prototype.update;
+  Fighter.prototype.update = function () {
+    if (this.__diAttente && !(this.hitlag > 0)) {
+      try { appliqueDI(this); } catch (e) { this.__diAttente = false; }
+    }
+    return majOrig.apply(this, arguments);
+  };
+
+  /* une mort ou une réapparition annule un DI en attente */
+  const dieOrig = Fighter.prototype.die;
+  if (typeof dieOrig === 'function') {
+    Fighter.prototype.die = function () {
+      this.__diAttente = false;
+      return dieOrig.apply(this, arguments);
+    };
+  }
+})();
+
+
+/* ===== 104-juice.js ===== */
+/* ============================================================
+   SMASH PÉI — CHAQUE COUP À SA JUSTE DOSE
+
+   Le joueur demande que les effets suivent la puissance des coups :
+   un jab discret, un smash chargé qui éclaire, secoue et éclabousse.
+
+   Le jeu ne manquait pas d'effets — trois couches s'en occupent déjà
+   (le moteur, le module 50, le module 96). Il manquait une ÉCHELLE.
+   Mesure sur un vrai match, Ti Jean frappant le Volkan, tempo coupé :
+
+       coup                 % cible   tremblement   zoom   flash
+       jab                     0          5,9        0      0
+       tilt avant              0          7,4        0      0
+       aérien avant            0         11,9       0,57    0
+       smash avant             0         16,6       0,90    0
+       smash avant             120       16,6       0,90    0
+       smash CHARGÉ À FOND     0         18,0       1,00    0
+       smash CHARGÉ À FOND     120       18,0       1,00    0
+
+   Trois choses s'y lisent :
+
+     1. LE JAB SECOUE L'ÉCRAN. Six pixels pour une pichenette : à
+        quatre joueurs qui tapent, la caméra ne s'arrête jamais de
+        trembler, et le tremblement ne veut plus rien dire.
+
+     2. UN SMASH CHARGÉ À FOND N'A RIEN DE PLUS qu'un smash sec : 18
+        contre 16,6, même zoom à dix pour cent près, aucun éclair. Le
+        coup le plus risqué du jeu n'est pas récompensé à l'écran.
+
+     3. LA PUISSANCE NE REGARDE QUE LES DÉGÂTS. Un smash qui tue à
+        120 % s'affiche exactement comme le même smash à 0 %, qui fait
+        à peine reculer. Or ce que le joueur ressent, c'est l'ÉJECTION.
+
+   Et deux défauts qu'on trouve en regardant de près :
+
+     4. L'onde de choc du module 50 est orientée sur l'angle BRUT du
+        coup (`h.ang`) : pour tous les coups à angle « 361 » — la
+        moitié du jeu — elle part dans une direction que la victime ne
+        prendra jamais.
+
+     5. LES PARTICULES FANTÔMES. `FX.clear()`, appelé à chaque début
+        de match, vide la liste sans remettre à zéro le drapeau posé par
+        le module 87. Les particules encore à l'écran à la fin d'un
+        match sont alors reprises par le match suivant… et jamais
+        affichées ni mises à jour. Banc : 300 étincelles créées après
+        un `clear`, 300 perdues. Ce sont les premiers impacts du match
+        suivant qui disparaissent.
+
+   LA CORRECTION
+   Une PUISSANCE de 0 à 1 qui mêle les dégâts, la vitesse d'éjection et
+   la charge du smash ; cinq PALIERS, tous réglés dans la table
+   `JUICE` ci-dessous ; et une règle : les couches existantes gardent
+   leur dessin (étoile, onde, éclats), mais le TREMBLEMENT, le ZOOM et
+   l'ÉCLAIR d'un coup qui éjecte sont décidés ici, une seule fois, au
+   lieu d'être le maximum de trois avis différents. S'y ajoute une
+   GERBE au moment où la victime décolle, orientée sur sa vraie
+   trajectoire (DI compris).
+
+   La « dose d'effets » du joueur (module 93) garde le dernier mot : on
+   passe par `Match.shake`, `Match.flash` et `Match.zoomPunch`, qu'elle
+   enveloppe déjà. À zéro, il ne reste ni tremblement ni éclair.
+
+   RÉSULTAT, même banc :
+
+       coup                 % cible   palier   tremb.  zoom  éclair  gerbe
+       jab                   0-120    léger     1,5     0     0       0
+       tilt avant            0-120    léger     1,5     0     0       0
+       aérien avant          0-120    franc     4       0     0      3-10
+       smash avant           0        lourd     8      0,25   0       9
+       smash avant           120      smash    12      0,5   0,12    25
+       smash CHARGÉ À FOND   0-120    éclat    18      0,9   0,3    38-40
+
+   Inchangés, vérifiés au banc : coup dans le bouclier (aucun effet de
+   caméra), parade parfaite (tremblement 6, éclair 0,3, gel punitif de
+   26 images), dose à zéro (tout à zéro). Particules fantômes : 300
+   perdues sur 300 avant, 0 après (les 18 % qui manquent encore sont le
+   tri voulu du réglage de qualité, `FX.q()` = 0,8).
+   ============================================================ */
+(function dosageDesCoups() {
+  if (typeof Fighter === 'undefined' || !Fighter.prototype || !Fighter.prototype.takeHit) return;
+  if (typeof FX === 'undefined' || typeof ST === 'undefined') return;
+  if (Fighter.prototype.takeHit.__juice104) return;
+
+  /* ------------------------------------------------------------
+     LA TABLE — tout le réglage est ici.
+     ------------------------------------------------------------ */
+  const JUICE = {
+    /* La puissance, de 0 à 1 :
+         dégâts / DEGATS_REF  × POIDS_DEGATS
+       + éjection / EJECTION_REF × POIDS_EJECTION
+       + charge du smash (0 à 1) × BONUS_CHARGE */
+    PUISSANCE: {
+      DEGATS_REF: 30, POIDS_DEGATS: 0.6,
+      EJECTION_REF: 30, POIDS_EJECTION: 0.4,
+      BONUS_CHARGE: 0.25
+    },
+
+    /* Les paliers, du plus faible au plus fort. On retient le dernier
+       dont `min` est atteint.
+         tremble : amplitude du tremblement de caméra, en pixels
+         zoom    : coup de zoom (0 à 1)
+         eclair  : éclair blanc plein écran (0 à 1)
+         gerbe   : étincelles projetées au décollage de la victime
+         fumee   : bouffées de fumée au décollage
+         anneau  : onde de choc supplémentaire au décollage */
+    PALIERS: [
+      { nom: 'leger', min: 0,    tremble: 1.5, zoom: 0,    eclair: 0,    gerbe: 0,  fumee: 0, anneau: false },
+      { nom: 'franc', min: 0.2,  tremble: 4,   zoom: 0,    eclair: 0,    gerbe: 4,  fumee: 0, anneau: false },
+      { nom: 'lourd', min: 0.4,  tremble: 8,   zoom: 0.25, eclair: 0,    gerbe: 8,  fumee: 1, anneau: false },
+      { nom: 'smash', min: 0.6,  tremble: 12,  zoom: 0.5,  eclair: 0.12, gerbe: 14, fumee: 2, anneau: true },
+      { nom: 'eclat', min: 0.85, tremble: 18,  zoom: 0.9,  eclair: 0.3,  gerbe: 22, fumee: 4, anneau: true }
+    ],
+
+    /* Deux éclairs à moins de ÉCLAIR_RECHARGE images d'intervalle : le
+       second est ignoré. Dans une mêlée à quatre, une rafale d'éclairs
+       est un vrai risque pour les personnes photosensibles. */
+    ECLAIR_RECHARGE: 24,
+
+    /* La gerbe : vitesse des étincelles, ouverture du cône (radians),
+       durée de vie (images), et couleurs chaudes au cœur du jet. */
+    GERBE: { VITESSE: 7, VITESSE_PUISSANCE: 9, CONE: 0.55, VIE: [12, 24], TAILLE: [2.5, 5.5],
+             COULEURS: ['#ffffff', '#fff3b0', '#ffd166'] },
+    FUMEE: { COULEUR: '#a39a8e' }
+  };
+  window.JUICE = JUICE;
+
+  /* ============================================================
+     0) LES PARTICULES FANTÔMES
+     ============================================================ */
+  if (typeof FX.clear === 'function' && !FX.clear.__juice104) {
+    const clearOrig = FX.clear;
+    const clear = function () {
+      const r = clearOrig.apply(this, arguments);
+      try { for (const p of this.pool) p.__live = 0; } catch (e) {}
+      return r;
+    };
+    clear.__juice104 = 1;
+    FX.clear = clear;
+  }
+
+  /* ============================================================
+     1) DEUX GÉNÉRATEURS DE PLUS
+     Composés des générateurs existants : ils respectent donc le
+     réglage « particules » du joueur, le plafond de 1 400 et le
+     recyclage du pool.
+     ============================================================ */
+
+  /* La gerbe : un cône d'étincelles et de traits projeté dans l'axe
+     `ang` (radians, repère de l'écran). */
+  FX.gerbe = function (x, y, ang, n, p, col) {
+    const G = JUICE.GERBE;
+    for (let i = 0; i < n; i++) {
+      const a = ang + rnd(-G.CONE, G.CONE) * (1 - p * 0.4);
+      const v = rnd(0.5, 1) * (G.VITESSE + p * G.VITESSE_PUISSANCE);
+      const c = i % 4 === 3 && col ? col : pick(G.COULEURS);
+      if (i % 3 === 0) this.streak(x, y, Math.cos(a) * v, Math.sin(a) * v, c, rndi(G.VIE[0], G.VIE[1]), rnd(G.TAILLE[0], G.TAILLE[1]));
+      else this.spark(x, y, Math.cos(a) * v, Math.sin(a) * v, c, rndi(G.VIE[0], G.VIE[1]), rnd(G.TAILLE[0], G.TAILLE[1]));
+    }
+  };
+
+  /* Le panache : des bouffées qui restent en arrière du décollage. */
+  FX.panache = function (x, y, ang, n, col) {
+    for (let i = 0; i < n; i++)
+      this.smoke(x - Math.cos(ang) * i * 10, y - Math.sin(ang) * i * 10, 1, col || JUICE.FUMEE.COULEUR);
+  };
+
+  /* ============================================================
+     2) LA PUISSANCE ET LE PALIER
+     ============================================================ */
+  function charge(src) {
+    const mv = src && src.move;
+    if (!mv || !mv.charge || !mv.charge.max) return 0;
+    return clamp((src.charge || 0) / mv.charge.max, 0, 1);
+  }
+
+  function puissance(dmg, ejection, ch) {
+    const P = JUICE.PUISSANCE;
+    return clamp(dmg / P.DEGATS_REF * P.POIDS_DEGATS +
+                 ejection / P.EJECTION_REF * P.POIDS_EJECTION +
+                 ch * P.BONUS_CHARGE, 0, 1);
+  }
+
+  function palier(p) {
+    let r = JUICE.PALIERS[0];
+    for (const t of JUICE.PALIERS) if (p >= t.min) r = t;
+    return r;
+  }
+  JUICE.puissance = puissance;
+  JUICE.palier = palier;
+
+  /* L'écriture brute du coup de zoom. La caméra porte un accesseur
+     (module 93) qui multiplie toute écriture par la dose : pour
+     RESTAURER une valeur déjà dosée, on la divise d'abord. */
+  function ecritZoomBrut(cam, v) {
+    const d = Object.getOwnPropertyDescriptor(cam, 'punch');
+    if (d && d.set) {
+      const dose = (window.CADRE && typeof CADRE.fx === 'number') ? CADRE.fx : 1;
+      cam.punch = dose > 0 ? v / dose : 0;
+    } else cam.punch = v;
+  }
+
+  /* ============================================================
+     3) AU COUP
+     ============================================================ */
+  const orig = Fighter.prototype.takeHit;
+  const env = function (src, h, dir, hitPos) {
+    const M = this.M;
+    const cam = M && M.cam;
+    if (!M || !cam) return orig.call(this, src, h, dir, hitPos);
+
+    /* On écoute les trois couches au lieu de les laisser écrire :
+       tremblement et coup de zoom demandés pendant l'appel sont
+       retenus. Si le coup n'éjecte pas (bouclier, parade, armure), on
+       les rejoue tels quels : rien ne change pour ces cas-là. */
+    let tremble = 0, zoom = 0;
+    const zoomAvant = cam.punch || 0;
+    /* Un contre rappelle `takeHit` à l'intérieur de celui-ci : on
+       note ce qui était posé sur l'instance pour le remettre tel quel. */
+    const aShake = Object.prototype.hasOwnProperty.call(M, 'shake') ? M.shake : null;
+    const aZoom = Object.prototype.hasOwnProperty.call(M, 'zoomPunch') ? M.zoomPunch : null;
+    M.shake = function (v) { if (v > tremble) tremble = v; };
+    M.zoomPunch = function (v) { if (v > zoom) zoom = v; };
+
+    /* L'onde du module 50 : on lui donne l'angle réel d'éjection. */
+    const victime = this;
+    const frappeOrig = FX.frappe;
+    if (typeof frappeOrig === 'function') {
+      FX.frappe = function (x, y, ang, p, col, sol) {
+        if (typeof victime.kbAngle === 'number' && victime.kbSpeed > 0) {
+          const a = victime.kbAngle * Math.PI / 180;
+          ang = Math.atan2(-Math.sin(a), Math.cos(a));
+        }
+        return frappeOrig.call(this, x, y, ang, p, col, sol);
+      };
+    }
+
+    const dmgAvant = this.dmgTaken;
+    const kbAvant = this.kbSpeed, vxAvant = this.vx, vyAvant = this.vy;
+    let r;
+    try { r = orig.call(this, src, h, dir, hitPos); }
+    finally {
+      if (aShake) M.shake = aShake; else delete M.shake;
+      if (aZoom) M.zoomPunch = aZoom; else delete M.zoomPunch;
+      if (typeof frappeOrig === 'function') FX.frappe = frappeOrig;
+    }
+
+    try {
+      const lance = r && (this.state === ST.HITSTUN || this.state === ST.TUMBLE) &&
+                    (this.kbSpeed !== kbAvant || this.vx !== vxAvant || this.vy !== vyAvant);
+      if (!lance) {
+        /* comportement d'origine, à l'identique */
+        ecritZoomBrut(cam, Math.max(zoomAvant, cam.punch || 0));
+        if (tremble > 0) M.shake(tremble);
+        if (zoom > 0) M.zoomPunch(zoom);
+        return r;
+      }
+
+      const dmg = Math.max(0, this.dmgTaken - dmgAvant);
+      const p = puissance(dmg, this.kbSpeed || 0, charge(src));
+      const t = palier(p);
+
+      /* le coup de zoom écrit directement par le module 50 est annulé :
+         c'est le palier qui décide */
+      ecritZoomBrut(cam, zoomAvant);
+      if (t.tremble > 0) M.shake(t.tremble);
+      if (t.zoom > 0) M.zoomPunch(t.zoom);
+      if (t.eclair > 0 && (M.frame - (M.__juiceEclair || -999)) >= JUICE.ECLAIR_RECHARGE) {
+        M.__juiceEclair = M.frame;
+        M.flash(t.eclair);
+      }
+
+      /* la gerbe attend le décollage : pendant le gel, les deux corps
+         sont figés, les étincelles partiront avec la victime */
+      this.__juice = { p, t, col: (src && src.color) || this.color };
+      this.__palier = t.nom;
+    } catch (e) {
+      if (!dosageDesCoups.__vu) { dosageDesCoups.__vu = 1; try { console.error('[juice]', e); } catch (e2) {} }
+    }
+    return r;
+  };
+  env.__juice104 = 1;
+  for (const k of ['__lis', '__hitlag102', '__di103']) if (orig[k]) env[k] = orig[k];
+  Fighter.prototype.takeHit = env;
+
+  /* ============================================================
+     4) AU DÉCOLLAGE
+     La première image libre après le gel, une fois le DI appliqué
+     (module 103) et la première image de vol calculée : la
+     direction de la vitesse est la vraie trajectoire.
+     ============================================================ */
+  const majOrig = Fighter.prototype.update;
+  Fighter.prototype.update = function () {
+    const r = majOrig.apply(this, arguments);
+    const j = this.__juice;
+    if (j && !(this.hitlag > 0)) {
+      this.__juice = null;
+      try {
+        if ((this.state === ST.HITSTUN || this.state === ST.TUMBLE) && this.alive) {
+          const a = Math.atan2(this.vy, this.vx);
+          const x = this.cx !== undefined ? this.cx : this.x, y = this.cy !== undefined ? this.cy : this.y;
+          if (j.t.gerbe > 0) FX.gerbe(x, y, a, j.t.gerbe, j.p, j.col);
+          if (j.t.fumee > 0) FX.panache(x, y, a, j.t.fumee);
+          if (j.t.anneau) FX.ring(x, y, 30 + j.p * 40, '#ffffff', 14, 5, 2.4, 0.35, a + Math.PI / 2);
+        }
+      } catch (e) {}
+    }
+    return r;
+  };
+
+  const dieOrig = Fighter.prototype.die;
+  if (typeof dieOrig === 'function') {
+    Fighter.prototype.die = function () {
+      this.__juice = null;
+      return dieOrig.apply(this, arguments);
+    };
+  }
+})();
+
+
+/* ===== 105-sprites.js ===== */
+/* ============================================================
+   SMASH PÉI — UN PERSONNAGE PEUT PASSER EN SPRITES
+
+   Le joueur veut pouvoir faire un personnage dans Blender, sans
+   jeter le rendu vectoriel qui porte les 63 autres. Ce module est
+   l'autre bout du pipeline décrit dans `tools/` :
+
+       jeu  ──SPRITES.exporterPoses()──▶  <perso>.poses.json
+       Blender  (tools/blender/sp_rendu_spritesheet.py)  ──▶  PNG
+       Node     (tools/spritesheet/sp_assembler.mjs)     ──▶  <perso>.png
+                                                           + <perso>.json
+                                                           + <perso>.sprites.js
+       jeu  ◀──  sprites/<perso>.sprites.js
+
+   CE QU'IL FALLAIT RESPECTER
+   L'audit de l'étape 1 a montré que TOUT corps passe par une seule
+   fonction, `drawFighterRig(ctx, ch, pose, opt)` : le combat, les
+   replays, la sélection, le vestiaire, l'écran de victoire, le
+   portrait du HUD. C'est donc là, et seulement là, qu'on branche.
+   Un personnage déclaré en sprites est dessiné depuis sa planche ;
+   tous les autres passent par l'original, sans une ligne de
+   différence.
+
+   CHOISIR L'IMAGE SANS CONNAÎTRE L'ANIMATION
+   `drawFighterRig` ne reçoit qu'une POSE, jamais le nom de
+   l'animation. Plutôt que d'aller chercher l'état du combattant
+   partout où la fonction est appelée, on choisit l'image dont la
+   pose est LA PLUS PROCHE de la pose demandée : chaque image de la
+   planche garde la pose qui l'a produite. C'est ce qui permet aux
+   replays (qui ne connaissent que des poses) et aux menus de
+   fonctionner sans rien changer chez eux. Quand on sait qui est
+   dessiné (combat), on restreint la recherche à la famille
+   d'animation qui correspond à son état : idle, walk, run, jump,
+   attack, hitstun, victory.
+
+   Le déplacement du bassin (hipX), l'écrasement (sx, sy) et la
+   rotation du corps (hipRot, la vrille du TUMBLE) ne sont PAS rendus
+   dans Blender : ils sont appliqués ici, au dessin, exactement comme
+   le fait le squelette vectoriel. Autant d'images en moins, et une
+   vrille parfaitement fluide.
+
+   LES COSMÉTIQUES
+     · Les chapeaux, visages et lunettes « classiques » sont écrits EN
+       DUR dans `drawHead`, pas derrière un crochet. Pour qu'un
+       personnage en sprites les garde tous, le mode par défaut est
+       TÊTE VECTORIELLE : Blender rend le corps et le cou, et la tête
+       reste dessinée par `drawHead`, au point exact où le squelette
+       l'aurait posée. Chapeaux, visages, traits, clignement, bouche,
+       `COS_TETE` et `COS_VISAGE` : tout fonctionne comme avant.
+     · En mode TÊTE SPRITE (la tête est dans le rendu), seuls les
+       crochets étendus sont posés, sur les ancres calculées :
+       `COS_TETE`, `COS_VISAGE`, `drawTraitTete` pour les traits de
+       vestiaire. Les chapeaux classiques sont alors perdus.
+     · `COS_DOS` et les objets de dos du vestiaire sont dessinés
+       derrière le corps, sur les ancres du bassin et de la poitrine.
+     · `COS_AURA` ne dessine pas le corps, il émet des particules
+       depuis le combattant : il marche tel quel.
+     · Les PEAUX (recoloration) : la planche est peinte une fois pour
+       toutes. On retrouve l'écart de teinte, de saturation et de
+       luminosité entre la palette d'origine et la palette recolorée,
+       et on l'applique avec `ctx.filter`. Si le navigateur ne connaît
+       pas `ctx.filter`, la peau est ignorée, rien ne casse.
+
+   CE QUI NE S'APPLIQUE PAS À UN PERSONNAGE EN SPRITES
+   Les deux étages de lumière (modules 44 et 83 : dégradé, contre-
+   jour, vernis) enveloppent `drawFighterRig` AVANT nous, et nous
+   sommes la couche la plus externe : un personnage en sprites ne
+   passe donc pas par eux. C'est voulu — sa lumière est celle du
+   rendu Blender — mais c'est une différence visible à connaître.
+
+   Deux autres limites, propres à toute image pré-rendue :
+     · une pièce du vestiaire qui RETIRE un élément natif (un objet de
+       dos qui remplace la cape de Ti Jean) ne peut pas l'effacer : la
+       cape est peinte dans la planche ;
+     · la valeur de retour { headX, headY, … } est rendue, mais les
+       enveloppes 44 et 83 ne la transmettaient déjà pas : aucun
+       appelant ne s'en sert.
+
+   EN CAS DE PROBLÈME, ON RETOMBE SUR LE VECTORIEL : planche absente,
+   image pas encore chargée, métadonnées invalides, erreur au dessin,
+   image séparée ouverte en file:// (elle contaminerait le canevas :
+   l'exposition automatique du bloc 94 et l'export des clips lisent
+   l'écran). Un personnage ne disparaît jamais de l'écran.
+
+   MESURE — la chaîne complète, sans Blender : le jeu lui-même a servi
+   de moteur de rendu, au cadrage exact du script Blender, pour Ti Jean
+   (tête vectorielle) et le Volkan (tête sprite), 131 images chacun.
+     · le calcul du squelette du script Python et celui du jeu : 524
+       poses, écart maximal 1e-14 px ;
+     · silhouette sprite contre silhouette vectorielle, huit poses dont
+       une vrille : 5,1 % et 2,6 % de pixels différents (l'antialiasing
+       de la mise à l'échelle et la pose la plus proche) ;
+     · chapeau classique, COS_TETE, COS_DOS, COS_VISAGE et peau
+       recolorée : visibles sur les deux personnages en sprites ;
+     · un match à trois (deux en sprites, un vectoriel) : aucune erreur,
+       le canevas reste lisible (exposition et clips intacts).
+   ============================================================ */
+(function spritesheets() {
+  if (typeof window === 'undefined' || typeof drawFighterRig !== 'function') return;
+  if (window.SPRITES && window.SPRITES.__v105) return;
+
+  /* ------------------------------------------------------------
+     LA TABLE DE RÉGLAGE
+     ------------------------------------------------------------ */
+  const SPRITES_CONFIG = {
+    /* dossier des planches, relatif au fichier HTML */
+    DOSSIER: 'sprites/',
+    /* identifiants des personnages à charger au démarrage. Le module
+       injecte alors `sprites/<id>.sprites.js` ; fichier absent = le
+       personnage reste vectoriel, sans erreur. On peut aussi appeler
+       `SPRITES.charger('id')` à la main, et SPRITES.actif('id', false)
+       pour revenir au vectoriel.
+
+       Ti Jean est le premier combattant modélisé en 3D
+       (tools/blender/sp_modele.py) et rendu en style « Ultimate ».
+       Sa tête est dans le rendu : les chapeaux CLASSIQUES du vestiaire
+       ne s'affichent pas sur lui ; COS_TETE, COS_VISAGE, COS_DOS et les
+       auras, si. */
+    ACTIFS: ['tijean'],
+
+    /* Les familles d'animation et les états du combattant qui les
+       utilisent. Un état absent de la table cherche dans toute la
+       planche. */
+    FAMILLES: {
+      idle: ['idle', 'crouch', 'shield', 'shieldstun', 'ledgeget', 'dodge'],
+      walk: ['walk', 'turn'],
+      run: ['run', 'dash', 'slide'],
+      jump: ['jumpsquat', 'air', 'land', 'landlag', 'entry', 'respawn', 'airdodge', 'ledge'],
+      attack: ['attack', 'special', 'throw', 'grabbing'],
+      hitstun: ['hitstun', 'tumble', 'helpless', 'broken', 'grabbed', 'lose'],
+      victory: ['victory']
+    },
+
+    /* Poids de chaque articulation dans la distance entre deux poses
+       (degrés pour les angles, pixels pour hipY). */
+    POIDS: {
+      torso: 1.2, head: 0.4, headX: 0.5, headY: 0.5, lean: 0.5,
+      shL: 1, elL: 0.8, shR: 1, elR: 0.8,
+      hpL: 1, knL: 0.8, hpR: 1, knR: 0.8,
+      hipY: 2.5, tail: 0.1, wing: 0.1, mouth: 4, eye: 4
+    },
+
+    /* L'export des poses (voir `exporterPoses`). `periode` en images
+       de jeu : on échantillonne un cycle complet. */
+    EXPORT: {
+      idle: { pose: 'idle', periode: 2 * Math.PI / 0.06, n: 16, boucle: true },
+      walk: { pose: 'walk', periode: 2 * Math.PI / 0.20, n: 12, boucle: true },
+      run: { pose: 'run', periode: 2 * Math.PI / 0.32, n: 10, boucle: true },
+      jump: { suite: [['jumpSquat', 1], ['airMonte', 4], ['airDescend', 4], ['land', 1]], boucle: false },
+      hitstun: { suite: [['hurt', 6], ['tumble', 1]], boucle: true },
+      victory: { pose: 'victory', periode: 2 * Math.PI / 0.11, n: 12, boucle: true }
+    },
+    /* les attaques rendues par défaut : une animation `attack_<nom>`
+       par entrée, échantillonnée sur ATTAQUE_IMAGES images */
+    ATTAQUES: ['jab1', 'ftilt', 'fsmash', 'usmash', 'dsmash', 'nair', 'fair', 'dair'],
+    ATTAQUE_IMAGES: 8
+  };
+
+  /* ------------------------------------------------------------
+     LE SQUELETTE D'UN PERSONNAGE
+     Les mêmes longueurs que `drawFighterRig`, recalculées ici pour
+     placer la tête et les ancres sans dessiner le squelette.
+     ------------------------------------------------------------ */
+  function rigDe(ch) {
+    const B = ch.build || {};
+    const bw = B.width || 1, bh = B.height || 1, ht = B.headScale || 1;
+    const th = RIG.thigh * bh * (B.leg || 1), sh = RIG.shin * bh * (B.leg || 1);
+    return {
+      bw, bh,
+      torsoLen: RIG.torsoLen * bh * (B.torso || 1),
+      headR: RIG.headR * ht,
+      shoulderW: RIG.shoulderW * bw,
+      upArm: RIG.upArm * bh * (B.arm || 1), foreArm: RIG.foreArm * bh * (B.arm || 1),
+      hipW: RIG.hipW * bw,
+      thigh: th, shin: sh, legLen: th + sh,
+      neck: RIG.neck * bh,
+      limbW: (B.limbW || 1) * 5.6
+    };
+  }
+
+  /* Les ancres, dans le repère local du squelette (pieds en 0,0,
+     y vers le bas), pour une pose donnée : exactement les formules de
+     `drawFighterRig`. */
+  function ancres(R, p) {
+    const hipY = -R.legLen * 0.92 + (p.hipY || 0);
+    const [cx, cy] = fkPoint(0, hipY, (p.torso || 0) + (p.lean || 0) * 0.4, R.torsoLen);
+    const [hx, hy] = fkPoint(cx, cy, (p.torso || 0) + (p.head || 0) * 0.35, R.neck + R.headR * 0.72);
+    return { hipX: 0, hipY, cx, cy, hx: hx + (p.headX || 0), hy: hy + (p.headY || 0), headR: R.headR, hxBrut: hx, hyBrut: hy };
+  }
+
+  /* ------------------------------------------------------------
+     LE REGISTRE
+     ------------------------------------------------------------ */
+  const planches = Object.create(null);     // id -> { meta, img, pret, familles }
+  const actifs = Object.create(null);       // id -> true | false (bascule manuelle)
+  let avertis = Object.create(null);
+
+  function avertit(cle, msg, e) {
+    if (avertis[cle]) return;
+    avertis[cle] = 1;
+    try { console.warn('Smash Péi — sprites : ' + msg, e || ''); } catch (x) {}
+  }
+
+  function enregistrer(meta) {
+    if (!meta || meta.format !== 'smashpei-sprites/1' || !meta.perso || !meta.animations) {
+      avertit('format', 'métadonnées ignorées (format inconnu)', meta && meta.format);
+      return false;
+    }
+    const id = meta.perso;
+    /* Ouvert depuis le disque, une image chargée depuis un FICHIER
+       contamine le canevas du jeu : l'exposition automatique (bloc 94)
+       ne peut plus mesurer l'écran, et l'export des clips enregistre un
+       canevas illisible. Une image en data: ne contamine rien — c'est ce
+       que l'assembleur produit par défaut. */
+    if (!meta.imageData && typeof location !== 'undefined' && location.protocol === 'file:') {
+      avertit('file-' + id, '« ' + id + ' » : image séparée refusée en file:// ; relancez ' +
+              'sp_assembler.mjs sans --image-separee (le personnage reste vectoriel)');
+      return false;
+    }
+    const P = { meta, img: new Image(), pret: false, familles: Object.create(null), toutes: [] };
+    for (const nom in meta.animations) {
+      const a = meta.animations[nom];
+      const fam = nom.split('_')[0];
+      for (const fr of a.frames || []) {
+        fr.anim = nom;
+        (P.familles[fam] || (P.familles[fam] = [])).push(fr);
+        P.toutes.push(fr);
+      }
+    }
+    if (!P.toutes.length) { avertit('vide-' + id, 'planche vide pour « ' + id + ' »'); return false; }
+    P.img.onload = () => { P.pret = true; };
+    P.img.onerror = e => avertit('img-' + id, 'image introuvable : ' + P.img.src, e);
+    P.img.src = meta.imageData || (SPRITES_CONFIG.DOSSIER + (meta.image || id + '.png'));
+    planches[id] = P;
+    if (actifs[id] === undefined) actifs[id] = true;
+    return true;
+  }
+
+  function charger(id) {
+    if (!id || typeof document === 'undefined') return;
+    const s = document.createElement('script');
+    s.src = SPRITES_CONFIG.DOSSIER + id + '.sprites.js';
+    s.onerror = () => avertit('js-' + id, 'fichier absent : ' + s.src + ' (le personnage reste vectoriel)');
+    document.head.appendChild(s);
+  }
+
+  function planchePour(ch) {
+    if (!ch) return null;
+    const base = ch.__base || ch;
+    const id = base.id;
+    if (!id || actifs[id] === false) return null;
+    const P = planches[id];
+    return P && P.pret ? P : null;
+  }
+
+  /* ------------------------------------------------------------
+     LA POSE LA PLUS PROCHE
+     ------------------------------------------------------------ */
+  const CLES = Object.keys(SPRITES_CONFIG.POIDS);
+  function distance(a, b, seuil) {
+    let d = 0;
+    for (const k of CLES) {
+      const av = a[k] !== undefined ? a[k] : REST[k];
+      const bv = b[k] !== undefined ? b[k] : REST[k];
+      const e = (av - bv) * SPRITES_CONFIG.POIDS[k];
+      d += e * e;
+      if (d > seuil) return d;               // on arrête dès qu'on a perdu
+    }
+    return d;
+  }
+
+  const FAMILLE_ETAT = Object.create(null);
+  for (const fam in SPRITES_CONFIG.FAMILLES)
+    for (const e of SPRITES_CONFIG.FAMILLES[fam]) FAMILLE_ETAT[e] = fam;
+
+  let courant = null;                        // le combattant en cours de dessin
+
+  function choisitImage(P, pose, ch) {
+    let liste = P.toutes;
+    const f = courant;
+    if (f && f.char === ch && f.state) {
+      const fam = FAMILLE_ETAT[f.state];
+      /* une attaque : on essaie d'abord l'animation du coup lui-même */
+      if (fam === 'attack' && f.move && f.move.anim && P.meta.animations['attack_' + f.move.anim])
+        liste = P.meta.animations['attack_' + f.move.anim].frames;
+      else if (fam && P.familles[fam]) liste = P.familles[fam];
+    }
+    let best = null, bd = Infinity;
+    for (const fr of liste) {
+      const d = distance(pose, fr.pose || REST, bd);
+      if (d < bd) { bd = d; best = fr; }
+    }
+    return best;
+  }
+
+  /* ------------------------------------------------------------
+     LA PEAU : l'écart de couleur, en filtre
+     ------------------------------------------------------------ */
+  const FILTRE_OK = (function () {
+    try { const c = document.createElement('canvas').getContext('2d'); return c && 'filter' in c; }
+    catch (e) { return false; }
+  })();
+  const _filtres = new WeakMap();
+  function filtrePeau(ch) {
+    if (!FILTRE_OK) return 'none';
+    const base = ch.__base || ch;
+    if (!ch.pal || !base.pal || ch.pal === base.pal) return 'none';
+    if (_filtres.has(ch)) return _filtres.get(ch);
+    let f = 'none';
+    try {
+      const k = ch.pal.skin ? 'skin' : 'cloth';
+      const a = base.pal[k], b = ch.pal[k];
+      if (a && b && a !== b) {
+        const A = rgb2hsl(...hex2rgb(a)), Bc = rgb2hsl(...hex2rgb(b));
+        const dh = Math.round(Bc[0] - A[0]);
+        const sat = A[1] > 0.02 ? clamp(Bc[1] / A[1], 0, 3) : 1;
+        const lum = A[2] > 0.02 ? clamp(Bc[2] / A[2], 0.2, 3) : 1;
+        f = `hue-rotate(${dh}deg) saturate(${sat.toFixed(2)}) brightness(${lum.toFixed(2)})`;
+      }
+    } catch (e) { f = 'none'; }
+    _filtres.set(ch, f);
+    return f;
+  }
+
+  /* ------------------------------------------------------------
+     LE DESSIN
+     ------------------------------------------------------------ */
+  function dessineSprite(ctx, ch, pose, opt, P) {
+    const meta = P.meta;
+    const fr = choisitImage(P, pose, ch);
+    if (!fr) return null;
+    /* Le squelette de RÉFÉRENCE est celui du rendu, gardé dans la
+       planche : si le gabarit du personnage change ensuite (une
+       retouche de silhouette, module 106), la tête et les ancres
+       restent posées sur le corps PEINT, pas sur le nouveau. */
+    const R = (meta.rig && meta.rig.legLen) ? meta.rig : rigDe(ch);
+    const S = opt.scale !== undefined ? opt.scale : 1;
+    const e = meta.echelle || 1;              // pixels de planche par pixel de jeu
+    const f = ch.features || {};
+    const Pal = ch.pal || {};
+    const An = ancres(R, fr.pose || REST);
+    /* Les ancres MESURÉES par Blender priment : en vue trois-quarts, le
+       corps 3D ne tombe pas exactement sur le squelette plat du jeu. */
+    const M3 = fr.ancres;
+    if (M3) {
+      An.hx = An.hxBrut = M3.hx; An.hy = An.hyBrut = M3.hy;
+      An.cx = M3.cx; An.cy = M3.cy; An.hipX = M3.hipX; An.hipY = M3.hipY;
+    }
+
+    ctx.save();
+    ctx.scale(S, S);
+    /* les mêmes transformations que le squelette vectoriel */
+    ctx.translate(pose.hipX || 0, 0);
+    ctx.scale(pose.sx || 1, pose.sy || 1);
+    const hipY = M3 ? M3.hipY : -R.legLen * 0.92 + (fr.pose ? fr.pose.hipY || 0 : 0);
+    ctx.save();
+    ctx.translate(0, hipY);
+    ctx.rotate(rad(pose.hipRot || 0));
+    ctx.translate(0, -hipY);
+
+    /* 1) derrière le corps : les objets de dos du vestiaire */
+    const gab = (R.bw + R.bh) / 2;
+    const baseF = ((ch.__base || ch).features) || {};
+    if (f.back && f.back !== baseF.back && typeof drawBackItem === 'function')
+      drawBackItem(ctx, An.hipX, An.hipY, An.cx, An.cy, pose, Pal, f.back, gab);
+    if (f.backX && typeof COS_DOS === 'function')
+      COS_DOS(ctx, An.hipX, An.hipY, An.cx, An.cy, pose, Pal, f.backX, gab);
+
+    /* 2) le corps */
+    const filtre = filtrePeau(ch);
+    if (filtre !== 'none') ctx.filter = filtre;
+    ctx.drawImage(P.img, fr.x, fr.y, fr.w, fr.h, -fr.ox / e, -fr.oy / e, fr.w / e, fr.h / e);
+    if (opt.flash > 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha *= clamp(opt.flash, 0, 1);
+      ctx.drawImage(P.img, fr.x, fr.y, fr.w, fr.h, -fr.ox / e, -fr.oy / e, fr.w / e, fr.h / e);
+    }
+    ctx.restore();                           // rotation du bassin, filtre, flash
+    ctx.save();
+    ctx.translate(0, hipY); ctx.rotate(rad(pose.hipRot || 0)); ctx.translate(0, -hipY);
+
+    /* 3) la tête */
+    if ((meta.tete || 'vectorielle') === 'vectorielle') {
+      /* la VRAIE pose pour la tête : la bouche, les yeux et le
+         clignement restent ceux du moment, pas ceux de l'image */
+      const p2 = Object.assign({}, fr.pose || REST, {
+        head: pose.head, headX: pose.headX, headY: pose.headY, mouth: pose.mouth, eye: pose.eye
+      });
+      const A2 = ancres(R, p2);
+      drawHead(ctx, A2.hx, A2.hy, R.headR, p2, ch, Pal, opt);
+      An.hx = A2.hx; An.hy = A2.hy;
+    } else {
+      /* tête dans le rendu : on pose seulement les crochets étendus,
+         dans le repère de la tête, ajusté au gabarit comme dans drawHead */
+      const p = fr.pose || REST;
+      ctx.save();
+      ctx.translate(An.hx, An.hy);
+      ctx.rotate(rad((p.head || 0) * 0.5 + (p.torso || 0) * 0.3));
+      const FIT = cosFitTete(ch, R.headR, f.head || 'round', f);
+      ctx.translate(FIT.dx, FIT.dy); ctx.scale(FIT.sx, FIT.sy);
+      if (f.cosTete && typeof drawTraitTete === 'function') drawTraitTete(ctx, R.headR, Pal, f.cosTete);
+      if (f.hatX && typeof COS_TETE === 'function') COS_TETE(ctx, R.headR, f, Pal, pose);
+      if (f.faceX && typeof COS_VISAGE === 'function') COS_VISAGE(ctx, R.headR, f, Pal, pose);
+      ctx.restore();
+    }
+    ctx.restore();
+    ctx.restore();
+    /* même valeur de retour que drawFighterRig */
+    return { headX: An.hxBrut, headY: An.hyBrut, headR: R.headR, chestX: An.cx, chestY: An.cy, sprite: fr.anim };
+  }
+
+  const rigOrig = window.drawFighterRig;
+  const rigEnv = function (ctx, ch, pose, opt) {
+    const P = planchePour(ch);
+    if (P) {
+      try {
+        const r = dessineSprite(ctx, ch, pose || REST, opt || {}, P);
+        if (r) return r;
+      } catch (e) {
+        avertit('dessin-' + ((ch.__base || ch).id), 'erreur au dessin, retour au vectoriel', e);
+        actifs[(ch.__base || ch).id] = false;
+      }
+    }
+    return rigOrig.apply(this, arguments);
+  };
+  rigEnv.__v105 = 1;
+  window.drawFighterRig = rigEnv;
+
+  /* Le combat sait QUI il dessine : on le retient le temps du dessin. */
+  if (typeof Fighter !== 'undefined' && Fighter.prototype && Fighter.prototype.draw) {
+    const drawOrig = Fighter.prototype.draw;
+    Fighter.prototype.draw = function () {
+      const av = courant;
+      courant = this;
+      try { return drawOrig.apply(this, arguments); }
+      finally { courant = av; }
+    };
+  }
+
+  /* ------------------------------------------------------------
+     L'EXPORT DES POSES — le point de départ du pipeline.
+     Dans la console du navigateur, le jeu ouvert :
+         SPRITES.exporterPoses('tijean')
+     télécharge `tijean.poses.json`.
+     ------------------------------------------------------------ */
+  function normalise(p) {
+    const o = {};
+    for (const k of POSE_KEYS) {
+      let v = p[k] !== undefined ? p[k] : REST[k];
+      if (k === 'hipX' || k === 'hipRot') v = 0;         // appliqués au dessin
+      if (k === 'sx' || k === 'sy') v = 1;
+      o[k] = Math.round(v * 100) / 100;
+    }
+    return o;
+  }
+
+  function poseNommee(nom, t, ch) {
+    if (nom === 'airMonte') return Poses.air(t, { vy: -1 });
+    if (nom === 'airDescend') return Poses.air(t, { vy: 1 });
+    if (nom === 'victory') return Poses.victory(t, ch);
+    return Poses[nom](t);
+  }
+
+  function exporterPoses(id, options) {
+    const o = options || {};
+    const ch = (typeof CHARS !== 'undefined' && CHARS[id]) || null;
+    if (!ch) throw new Error('personnage inconnu : ' + id);
+    const E = SPRITES_CONFIG.EXPORT;
+    const anims = {};
+    for (const nom in E) {
+      const d = E[nom], poses = [];
+      if (d.suite) {
+        for (const [p, n] of d.suite)
+          for (let i = 0; i < n; i++) poses.push(normalise(poseNommee(p, i * 3, ch)));
+      } else {
+        for (let i = 0; i < d.n; i++) poses.push(normalise(poseNommee(d.pose, (i / d.n) * d.periode, ch)));
+      }
+      anims[nom] = { boucle: !!d.boucle, poses };
+    }
+    const attaques = (o.attaques || SPRITES_CONFIG.ATTAQUES).filter(k => ATK_ANIM[k]);
+    const n = o.imagesAttaque || SPRITES_CONFIG.ATTAQUE_IMAGES;
+    for (const k of attaques) {
+      const poses = [];
+      for (let i = 0; i < n; i++) poses.push(normalise(sampleFrames(ATK_ANIM[k], i / (n - 1))));
+      anims['attack_' + k] = { boucle: false, poses };
+    }
+    const doc = {
+      format: 'smashpei-poses/1',
+      perso: id,
+      nom: ch.nFR || id,
+      tete: (ch.features && ch.features.head) || 'round',
+      rig: rigDe(ch),
+      /* le repère : pieds en (0,0), x vers l'avant, y vers le BAS,
+         angles en degrés, 0 = vers le haut, positif = vers l'avant */
+      cles: POSE_KEYS.slice(),
+      palette: Object.assign({}, ch.pal),
+      animations: anims
+    };
+    if (o.telecharger !== false && typeof document !== 'undefined') {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 1)], { type: 'application/json' }));
+      a.download = id + '.poses.json';
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    }
+    return doc;
+  }
+
+  /* ------------------------------------------------------------
+     L'INTERFACE PUBLIQUE
+     ------------------------------------------------------------ */
+  const SPRITES = window.SPRITES = {
+    __v105: 1,
+    CONFIG: SPRITES_CONFIG,
+    enregistrer,
+    charger,
+    exporterPoses,
+    /* basculer un personnage : SPRITES.actif('tijean', false) le
+       remet en vectoriel sans recharger la page */
+    actif(id, on) { if (on === undefined) return actifs[id] !== false && !!planches[id]; actifs[id] = !!on; return actifs[id]; },
+    estSprite(ch) { return !!planchePour(ch); },
+    liste() { return Object.keys(planches); },
+    _rigDe: rigDe, _ancres: ancres
+  };
+  window.SPRITES_CONFIG = SPRITES_CONFIG;
+
+  /* les planches chargées avant ce module (balise <script> placée
+     plus haut dans la page) attendaient dans une file */
+  if (Array.isArray(window.SPRITES_EN_ATTENTE)) {
+    for (const m of window.SPRITES_EN_ATTENTE) enregistrer(m);
+    window.SPRITES_EN_ATTENTE.length = 0;
+  }
+  for (const id of SPRITES_CONFIG.ACTIFS) charger(id);
+})();
+
+
+/* ===== 106-silhouettes-fines.js ===== */
+/* ============================================================
+   SMASH PÉI — CEUX QUI SE RESSEMBLAIENT ENCORE
+
+   Le module 58 a donné à chacun sa tête ; le 68, sa matière. Le joueur
+   demande de reprendre les personnages qui restent proches à l'œil,
+   sans défaire ce qui a été réglé.
+
+   LA MESURE
+   On ne juge pas une ressemblance au jugé. Chaque combattant est rendu
+   à sa taille de jeu, en attente et en pleine course ; on compare deux
+   à deux la SILHOUETTE (part de pixels communs, sur les deux poses) et
+   la COULEUR (écart moyen sur trois bandes : tête, buste, jambes).
+   L'indice de confusion est  silhouette × (1 − écart de couleur)².
+
+       médiane, chacun contre son plus proche voisin     0,713
+       pire paire (Ségatié / Ti Mbiwi)                   0,852
+       personnages dont un voisin dépasse 0,70           35 sur 63
+
+   Les paires les plus proches forment trois groupes, et ils disent
+   ce qui manque :
+     · les HUMAINS — Ségatié, Ti Mbiwi, Kréol Surfeur, Ti Kréol,
+       Zoreil, Gramoun, Maron, Pésèr, Sab' Kann, Ti Jean, Ti Bazar :
+       même carrure, mêmes proportions, peaux voisines ;
+     · les OISEAUX — Paille-en-Queue, Payanké Blan, Kok Batay, la
+       Dodo : quatre corps blancs identiques, seuls les accessoires
+       diffèrent ;
+     · les LOURDS — Volkan et Grand Bwa, Kaz Tolé et Yab.
+
+   ET UNE CAUSE QU'ON N'ATTENDAIT PAS
+   La forme du TORSE est lue dans `build.shape`. Le module 58 y écrit
+   la famille de tête — mais `TORSO_SHAPE` ne connaît que quatre
+   formes (round, bulky, slim, oval). Toutes les autres familles —
+   beak, leaf, long, drop, wide, shark, soit VINGT-NEUF combattants —
+   retombent en silence sur le torse ovale. Les oiseaux ont le buste
+   d'un homme, la liane celui d'un pêcheur. C'est exactement le défaut
+   que le module 58 avait corrigé pour les têtes, un étage plus bas.
+
+   LA CORRECTION, en deux temps, sans toucher à rien de ce qui compte
+   pour le combat :
+
+     1. SIX TORSES qui manquaient, un par famille : bréchet d'oiseau,
+        tige de plante, buste de lézard, poire, carrure large, torpille
+        de requin. Et trois formes de plus, disponibles pour tous :
+        athlète (en V), tonneau, et la poire déjà citée.
+
+     2. DES RETOUCHES CIBLÉES, pour les seuls personnages des paires
+        mesurées : une forme de torse et quelques proportions, tirées
+        de ce que le personnage EST (un danseur de séga a des jambes,
+        une dodo n'en a presque pas, un pêcheur a de l'allonge).
+
+   Ce qui ne bouge JAMAIS : la famille de tête (module 58), la largeur
+   du gabarit — c'est elle qui fixe la boîte de collision —, la boîte
+   elle-même, les statistiques, les coups. Chaque proportion reste dans
+   ±12 % de sa valeur, et la stature combinée dans ±8 %. Les tenues du
+   module 68 et les matières du module 59 relisent la même table de
+   torses : elles suivent seules.
+
+   CE QUE LA PREMIÈRE VERSION A APPRIS
+   Les six torses seuls ne changent presque rien à la mesure : à la
+   taille du jeu, le buste est caché par les bras, les ailes et les
+   habits. Et des retouches écrites une à une, chacune juste, se
+   gênaient : éloigner le Ségatié du Ti Mbiwi le collait à la Vanille,
+   Kaz Tolé et Yab se RAPPROCHAIENT (0,755 → 0,792). Ce qui se lit,
+   c'est la STATURE, la taille de la TÊTE et l'épaisseur des MEMBRES —
+   et il faut les choisir ensemble. D'où la recherche décrite plus bas.
+
+   RÉSULTAT, même banc :
+
+                                                    avant    après
+       médiane, chacun contre son plus proche voisin  0,713    0,691
+       pire paire                                     0,852    0,776
+       personnages dont un voisin dépasse 0,70        35       25
+       boîtes de collision modifiées                   —        0
+       stature (pieds → crâne)                         —     −6 % à +8 %
+
+   Deux personnages non retouchés se rapprochent un peu d'un voisin
+   devenu différent : Bourbon Pointu (0,668 → 0,696) et le Cabri
+   (0,689 → 0,713). C'est le prix d'un réglage global ; ils sont les
+   premiers candidats d'une prochaine passe.
+   ============================================================ */
+(function silhouettesFines() {
+  if (typeof CHARS === 'undefined' || typeof TORSO_SHAPE === 'undefined') return;
+  if (silhouettesFines.__fait) return;
+  silhouettesFines.__fait = true;
+
+  /* ------------------------------------------------------------
+     1) LES TORSES — [épaules, taille, hanches], en largeurs d'épaule,
+        dans la même convention que les quatre d'origine.
+     ------------------------------------------------------------ */
+  const TORSES = {
+    brechet:  [1.02, 1.30, 0.80],   // oiseau : poitrail bombé, hanches fines
+    tige:     [0.90, 0.64, 0.72],   // plante, liane : un buste qui file
+    lezard:   [0.92, 0.84, 1.00],   // reptile : long, bas, sans taille
+    poire:    [0.88, 1.10, 1.24],   // épaules tombantes, ventre et hanches
+    large:    [1.30, 1.20, 1.06],   // carrure pleine, de haut en bas
+    torpille: [1.36, 0.94, 0.76],   // requin : tout dans les épaules
+    athlete:  [1.32, 0.86, 0.84],   // en V : épaules larges, taille prise
+    tonneau:  [1.18, 1.46, 1.20]    // rond comme une marmite
+  };
+  for (const k in TORSES) if (!TORSO_SHAPE[k]) TORSO_SHAPE[k] = TORSES[k];
+
+  /* la famille de tête -> son torse par défaut. On n'écrase jamais
+     une forme de torse qui existe déjà sous ce nom. */
+  const PAR_FAMILLE = { beak: 'brechet', leaf: 'tige', long: 'lezard', drop: 'poire', wide: 'large', shark: 'torpille' };
+  for (const fam in PAR_FAMILLE)
+    if (!TORSO_SHAPE[fam]) TORSO_SHAPE[fam] = TORSO_SHAPE[PAR_FAMILLE[fam]];
+
+  /* ------------------------------------------------------------
+     2) LES RETOUCHES
+        torse  : forme du torse (clé de TORSO_SHAPE)
+        jambe, bras, tronc : longueur des jambes, des bras, du buste
+        tete   : taille de la tête        membres : épaisseur des membres
+        taille : la stature entière (build.height), bornée à BORNES_TAILLE
+        Toutes sont des MULTIPLICATEURS, bornés à BORNES.
+     ------------------------------------------------------------ */
+  const BORNES = [0.88, 1.12];
+
+  /* Les variantes retenues. Pour chaque personnage, trois ou quatre
+     variantes toutes plausibles pour ce qu'il est ont été écrites à la
+     main ; une recherche a ensuite choisi, parmi elles, la combinaison
+     qui réduit le plus les confusions SUR LES 63 À LA FOIS — éloigner
+     un humain de son voisin ne doit pas le rapprocher d'un autre, et
+     c'est exactement ce qu'une première version écrite à la main
+     faisait. Ti Kréol et Ti Jean servent de référence : on n'y touche
+     pas. La Dodo et Macatia n'y ont rien gagné : ils restent tels quels. */
+  const RETOUCHES = {
+    /* --- les humains --- */
+    segatier: { taille: 1.08, jambe: 1.10, membres: 0.88, bras: 1.08 },               // le danseur de séga : grand, délié, tout en jambes
+    mbiwi:    { torse: 'athlete', taille: 0.94, bras: 1.08, jambe: 0.90, tete: 1.06 }, // deux bambous frappés : compact, les bras devant
+    surfeur:  { torse: 'athlete', taille: 1.08, membres: 1.12, tete: 0.92 },           // le surfeur : grand, en V
+    zoreil:   { torse: 'large', taille: 0.94, membres: 1.12 },                         // le randonneur : trapu, bâti pour porter
+    gramoun:  { torse: 'poire', taille: 0.93, jambe: 0.90, tete: 1.08 },               // l'ancien : tassé, la tête qui compte
+    maron:    { torse: 'athlete', membres: 1.12, bras: 1.04 },                         // l'homme des remparts : des bras qui grimpent
+    pesheur:  { torse: 'tige', taille: 1.06, bras: 1.12 },                             // allonge de rivière : haut, de longs bras
+    sabkann:  { torse: 'large', bras: 1.08, tete: 0.92 },                              // le coupeur de cannes : les épaules du travail
+    bazar:    { torse: 'poire', taille: 0.92, membres: 1.10 },                         // le marchand de tissus, bien installé
+    kal:      { torse: 'poire', taille: 0.92, jambe: 0.88 },                           // la vieille sorcière, voûtée
+    sirandane:{ torse: 'tige', taille: 1.08, jambe: 1.10, membres: 0.88 },             // le conteur : grand et mince
+    vanille:  { torse: 'tige', bras: 1.12, membres: 0.88, tete: 0.92 },                // la liane : des bras qui s'enroulent
+
+    /* --- les oiseaux --- */
+    paille:      { taille: 1.06, jambe: 1.12, membres: 0.88 },                         // la reine des airs : élancée, haute sur pattes
+    pailleblanc: { torse: 'tige', taille: 0.94, tete: 1.10 },                          // le fil blanc : petit, fin, la tête ronde
+    kok:         { taille: 0.94, tronc: 1.10, tete: 0.92 },                            // le coq de combat : bas sur pattes, le poitrail long
+
+    /* --- les lourds --- */
+    grandbwa: { jambe: 1.12, membres: 0.90 },                                          // le colosse de la forêt : haut comme un tronc
+    volkan:   { taille: 0.96, jambe: 0.90 },                                           // le titan de lave : tassé, massif
+    kaztole:  { torse: 'large', taille: 1.06, jambe: 1.10 },                           // la muraille de tôle : haute et carrée
+    yab:      { torse: 'tonneau', jambe: 0.90, tete: 1.10 },                           // l'alambic : la panse
+    cari:     { torse: 'tonneau', taille: 0.94 },                                      // la marmite ambulante
+    kavadi:   { torse: 'athlete', taille: 1.08, jambe: 1.10 },                         // le porteur de l'arche : grand, droit
+    roular:   { taille: 0.94, membres: 1.08 }                                          // le maître du maloya : ancré sur son tambour
+  };
+
+  /* la stature se lit plus que tout, mais elle éloigne le dessin de la
+     boîte de collision : elle a sa propre borne, plus serrée */
+  const BORNES_TAILLE = [0.92, 1.08];
+
+  const CHAMPS = { jambe: 'leg', bras: 'arm', tronc: 'torso', tete: 'headScale', membres: 'limbW' };
+  const appliquees = [];
+
+  /* La stature du squelette, des pieds au sommet du crâne, avec les
+     formules de drawFighterRig. La hauteur, les jambes et le buste se
+     multiplient : sans cette garde, « un peu plus grand » et « des
+     jambes un peu plus longues » faisaient ensemble près de 9 %. */
+  function stature(b) {
+    const bh = b.height || 1;
+    return (RIG.thigh + RIG.shin) * bh * (b.leg || 1) * 0.92 + RIG.torsoLen * bh * (b.torso || 1) +
+           RIG.neck * bh + RIG.headR * (b.headScale || 1) * 1.7;
+  }
+  for (const id in RETOUCHES) {
+    const c = CHARS[id];
+    if (!c || !c.build) continue;
+    const b = c.build, r = RETOUCHES[id];
+    if (b.__fines) continue;
+    b.__fines = true;
+    const avant = stature(b);
+    if (r.torse && TORSO_SHAPE[r.torse]) b.shape = r.torse;
+    if (r.taille !== undefined) b.height = (b.height || 1) * clamp(r.taille, BORNES_TAILLE[0], BORNES_TAILLE[1]);
+    for (const k in CHAMPS) {
+      if (r[k] === undefined) continue;
+      const cle = CHAMPS[k];
+      b[cle] = (b[cle] || 1) * clamp(r[k], BORNES[0], BORNES[1]);
+    }
+    /* la stature combinée reste dans BORNES_TAILLE : on corrige par la
+       hauteur, qui agit sur tout le corps d'un coup */
+    const k = stature(b) / avant;
+    const kb = clamp(k, BORNES_TAILLE[0], BORNES_TAILLE[1]);
+    if (k !== kb) b.height = (b.height || 1) * kb / k;
+    appliquees.push(id);
+  }
+
+  /* les personnages déjà dérivés par le vestiaire gardaient l'ancien
+     gabarit en cache */
+  try { if (typeof clearCosCache === 'function') clearCosCache(); } catch (e) {}
+
+  window.SILHOUETTES_FINES = { TORSES, PAR_FAMILLE, RETOUCHES, appliquees };
+})();
+
 </script>
 </body>
 </html>
